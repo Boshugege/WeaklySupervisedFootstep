@@ -1,0 +1,9 @@
+examples/
+output/
+.venv/
+.tmp/
+__pycache__/
+Data/Airtag/*
+Data/DAS/*
+Data/Video/*
+models/
