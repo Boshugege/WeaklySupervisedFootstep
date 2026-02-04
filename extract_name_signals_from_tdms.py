@@ -73,8 +73,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--skip-channels",
         type=int,
-        default=15,
-        help="Number of channels to skip from the beginning (default: 15). Set to 0 to keep all channels.",
+        default=18,
+        help="Number of channels to skip from the beginning (default: 18). Set to 0 to keep all channels.",
     )
     return p.parse_args()
 

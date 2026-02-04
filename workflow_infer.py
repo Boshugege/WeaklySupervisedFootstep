@@ -40,7 +40,7 @@ DEFAULT_TRIM_HEAD = 50.0   # 从开头裁掉50秒
 DEFAULT_TRIM_TAIL = 20.0   # 从结尾裁掉20秒
 
 # 通道屏蔽默认值
-DEFAULT_SKIP_CHANNELS = 15  # 跳过前15个通道
+DEFAULT_SKIP_CHANNELS = 18  # 跳过前18个通道
 
 
 def parse_args():

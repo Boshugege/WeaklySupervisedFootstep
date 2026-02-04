@@ -25,7 +25,7 @@ from pathlib import Path
 # 数据目录（相对于脚本所在目录）
 SCRIPT_DIR = Path(__file__).parent.resolve()
 DATA_DIR = SCRIPT_DIR / "Data"
-VIDEO_DIR = DATA_DIR / "Video"
+AUDIO_DIR = DATA_DIR / "Audio"  # 音频文件目录
 AIRTAG_DIR = DATA_DIR / "Airtag"
 DAS_DIR = DATA_DIR / "DAS"
 
@@ -41,7 +41,7 @@ DEFAULT_TRIM_HEAD = 50.0   # 从开头裁掉50秒
 DEFAULT_TRIM_TAIL = 20.0   # 从结尾裁掉20秒
 
 # 通道屏蔽默认值
-DEFAULT_SKIP_CHANNELS = 15  # 跳过前15个通道
+DEFAULT_SKIP_CHANNELS = 18  # 跳过前18个通道
 
 
 def parse_args():
@@ -66,7 +66,7 @@ def parse_args():
     
     # 必需参数
     parser.add_argument("name", 
-                        help="目标名字（对应Video中的MP4文件名，不含扩展名）")
+                        help="目标名字（对应Audio中的mp3文件名，不含扩展名）")
     
     # 时间裁剪 - 从头尾裁掉的时长
     parser.add_argument("--trim_head", type=float, default=DEFAULT_TRIM_HEAD,
@@ -99,13 +99,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def check_video_exists(name: str) -> Path:
-    """检查视频文件是否存在"""
-    for ext in [".MP4", ".mp4", ".MOV", ".mov"]:
-        video_path = VIDEO_DIR / f"{name}{ext}"
-        if video_path.exists():
-            return video_path
-    raise FileNotFoundError(f"找不到视频文件: {VIDEO_DIR / name}.MP4")
+def check_audio_exists(name: str) -> Path:
+    """检查音频文件是否存在"""
+    audio_path = AUDIO_DIR / f"{name}.mp3"
+    if audio_path.exists():
+        return audio_path
+    raise FileNotFoundError(f"找不到音频文件: {AUDIO_DIR / name}.mp3")
 
 
 def check_airtag_exists(name: str) -> Path:
@@ -150,8 +149,8 @@ def main():
     # ===== 1. 检查输入文件 =====
     print(f"\n[CHECK] 检查输入文件...")
     try:
-        video_path = check_video_exists(name)
-        print(f"  ✓ 视频: {video_path}")
+        audio_path = check_audio_exists(name)
+        print(f"  ✓ 音频: {audio_path}")
     except FileNotFoundError as e:
         print(f"  ✗ {e}")
         return 1
@@ -243,7 +242,7 @@ def main():
     train_cmd = [
         sys.executable, str(SCRIPT_DIR / "WeaklySupervised_FootstepDetector.py"),
         "--das_csv", str(das_csv_path),
-        "--audio", str(video_path),
+        "--audio", str(audio_path),
         "--trim_start", str(trim_start),
         "--trim_end", str(trim_end),
         "--das_fs", str(args.das_fs),

@@ -1,14 +1,17 @@
 # 弱监督DAS脚步检测系统
 
 ```bash
-# 单人训练（默认：头部裁掉50s，尾部裁掉20s，跳过前15个通道）
+# 单人训练（默认：头部裁掉50s，尾部裁掉20s，跳过前18个通道）
 python workflow_train.py wangdihai
 
 # 自定义裁剪
 python workflow_train.py wangdihai --trim_head 60 --trim_tail 30
 
 # 多人联合训练（提高泛化性）
-python workflow_train_multi.py wangdihai wangjiahui
+# 打分
+python batch_audio_spectrogram.py
+# 按打分排 top 12
+python.exe workflow_train_multi.py --top_n 12 --label_source wangdihai
 
 # 推理
 python workflow_infer.py wangjiahui --model output/wangdihai/models/wangdihai_model.joblib
@@ -40,7 +43,7 @@ Data/
 - ✅ **自训练迭代**：通过多轮自训练逐步提高检测召回率
 - ✅ **多频带分析**：支持多个频带特征提取
 - ✅ **智能时间裁剪**：自动根据数据长度计算裁剪范围（头部/尾部）
-- ✅ **通道屏蔽**：可跳过噪声通道（默认跳过前15个）
+- ✅ **通道屏蔽**：可跳过噪声通道（默认跳过前18个）
 - ✅ **多人联合训练**：支持多人数据联合训练提高泛化性
 - ✅ **丰富可视化**：热图、轨迹图、对比图等多种输出
 - ✅ **调优工具**：独立的音频检测验证工具
@@ -128,7 +131,7 @@ python WeaklySupervised_FootstepDetector.py \
 | `name`                   | str   | 必需   | 目标名字（对应Video/Airtag文件名） |
 | `--trim_head`            | float | 50.0   | 从数据开头裁掉的时长（秒）         |
 | `--trim_tail`            | float | 20.0   | 从数据结尾裁掉的时长（秒）         |
-| `--skip_channels`        | int   | 15     | 跳过前N个通道（设为0保留所有）     |
+| `--skip_channels`        | int   | 18     | 跳过前N个通道（设为0保留所有）     |
 | `--das_fs`               | int   | 2000   | DAS采样率 (Hz)                     |
 | `--self_train_rounds`    | int   | 3      | 自训练迭代轮数                     |
 | `--confidence_threshold` | float | 0.7    | 高置信预测阈值                     |
@@ -137,7 +140,7 @@ python WeaklySupervised_FootstepDetector.py \
 #### 使用示例
 
 ```bash
-# 使用默认参数（头部-50s，尾部-20s，跳过前15通道）
+# 使用默认参数（头部-50s，尾部-20s，跳过前18通道）
 python workflow_train.py wangdihai
 
 # 自定义裁剪
@@ -156,7 +159,7 @@ python workflow_train.py wangdihai --skip_channels 0
 #### 功能
 
 - 合并多人数据进行联合训练
-- 统一的时间裁剪配置
+- 支持按名字读取裁剪表（根目录 `trim_profile.csv`）
 - 输出通用模型供推理使用
 
 #### 命令行参数
@@ -164,9 +167,10 @@ python workflow_train.py wangdihai --skip_channels 0
 | 参数                  | 类型  | 默认值          | 说明                       |
 | --------------------- | ----- | --------------- | -------------------------- |
 | `names`               | str[] | 必需（至少2个） | 训练数据的名字列表         |
-| `--trim_head`         | float | 50.0            | 从数据开头裁掉的时长（秒） |
-| `--trim_tail`         | float | 20.0            | 从数据结尾裁掉的时长（秒） |
-| `--skip_channels`     | int   | 15              | 跳过前N个通道              |
+| `--trim_head`         | float | None            | 全局头部裁剪；未指定时按裁剪表 |
+| `--trim_tail`         | float | None            | 全局尾部裁剪；未指定时按裁剪表 |
+| `--trim_profile`      | str   | trim_profile.csv| 按名字配置裁剪参数的CSV     |
+| `--skip_channels`     | int   | 18              | 跳过前N个通道              |
 | `--model_name`        | str   | auto            | 输出模型名称               |
 | `--self_train_rounds` | int   | 3               | 自训练迭代轮数             |
 
@@ -176,10 +180,13 @@ python workflow_train.py wangdihai --skip_channels 0
 # 两人联合训练
 python workflow_train_multi.py wangdihai wangjiahui
 
+# 按 trim_profile.csv 裁剪（默认：每人 head=20s, tail=10s）
+python workflow_train_multi.py wangdihai wangjiahui
+
 # 三人联合训练，自定义模型名
 python workflow_train_multi.py wangdihai wangjiahui wuwenxuan --model_name multi_3person
 
-# 自定义裁剪
+# 全局自定义裁剪（覆盖表单）
 python workflow_train_multi.py wangdihai wangjiahui --trim_head 60 --trim_tail 30
 ```
 
@@ -203,7 +210,7 @@ python workflow_train_multi.py wangdihai wangjiahui --trim_head 60 --trim_tail 3
 | `--model`, `-m`   | str   | 必需   | 模型文件路径（.joblib）    |
 | `--trim_head`     | float | 50.0   | 从数据开头裁掉的时长（秒） |
 | `--trim_tail`     | float | 20.0   | 从数据结尾裁掉的时长（秒） |
-| `--skip_channels` | int   | 15     | 跳过前N个通道              |
+| `--skip_channels` | int   | 18     | 跳过前N个通道              |
 | `--with_audio`    | flag  | -      | 同时使用音频进行对比验证   |
 
 #### 使用示例
@@ -235,7 +242,7 @@ python workflow_infer.py wangjiahui --model model.joblib --with_audio
 
 | 参数                | 类型  | 默认值 | 说明                           |
 | ------------------- | ----- | ------ | ------------------------------ |
-| `--skip-channels`   | int   | 15     | 跳过前N个通道（设为0保留所有） |
+| `--skip-channels`   | int   | 18     | 跳过前N个通道（设为0保留所有） |
 | `--fs`              | float | 2000   | DAS采样率 (Hz)                 |
 | `--use-airtag-only` | flag  | -      | 仅使用Airtag（无需Video）      |
 
@@ -536,16 +543,47 @@ python audio_step_tuning.py --audio video.mp4 --peak_height 1.0 --peak_prom 2.0
 | `confidence_threshold` | ↑ 提高   | 只保留高置信预测 |
 | `self_train_rounds`    | ↓ 减少   | 避免过度扩展     |
 
+#### 训练时新增评估输出（推荐先看这个再调参）
+
+训练日志中会新增以下输出（`[Eval]`）：
+
+- 样本统计：`Samples / Pos / Neg`
+- 验证集 `PR-AUC`
+- 不同阈值下的 `Precision / Recall / F1` 表
+- 推荐阈值：`Best threshold=...`
+- 当前阈值：`Current confidence_threshold=...`
+
+示例（节选）：
+
+```text
+[Eval] Samples=1200, Pos=300, Neg=900
+[Eval] Validation metrics by threshold:
+       thr    P      R      F1
+       0.50  0.82  0.71  0.76
+       0.55  0.86  0.68  0.76
+[Eval] PR-AUC=0.84
+[Eval] Best threshold=0.55 (P=0.860, R=0.680, F1=0.760)
+[Eval] Current confidence_threshold=0.70
+[Eval] Suggestion: try --confidence_threshold 0.55
+```
+
+按输出调参建议：
+
+- **优先**按 `Best threshold` 先调整 `--confidence_threshold`
+- 若 `PR-AUC < 0.70`：先优化音频弱标签质量（`peak_height/peak_prom`），再看模型参数
+- 若 `Recall`低但`Precision`高：降低 `confidence_threshold` 或增加 `self_train_rounds`
+- 若 `Precision`低但`Recall`高：提高 `confidence_threshold` 或减少 `self_train_rounds`
+- 若三个人结果波动大：优先用 `workflow_train_multi.py` 训练联合模型
+
 ---
 
 ### 滤波参数
 
 #### DAS滤波
 
-默认使用三个频带：
+默认使用两个频带：
 
 - `5-10 Hz`：主频带（脚步主要响应）
-- `2-5 Hz`：低频辅助
 - `10-20 Hz`：高频辅助
 
 可在 `Config` 类中修改 `das_bp_bands`。
@@ -623,7 +661,8 @@ align_dt = 0.0       # 无需额外时间对齐
 
 ### Q: 没有对应的音频文件怎么办？
 
-系统会自动切换到纯能量检测模式，但效果会下降。建议尽量提供音频文件。
+训练模式必须提供音频（用于生成弱标签），否则会直接报错。  
+如果已经有训练好的模型，可使用 `--load_model --inference_only` 在无音频条件下做推理。
 
 ### Q: 检测到的通道位置不准确？
 
@@ -696,7 +735,6 @@ pip install numpy pandas scipy matplotlib librosa scikit-learn
 ```
 DAS → 多频带带通滤波 → 短时能量 → 特征向量
      ├── 5-10Hz（主频带）
-     ├── 2-5Hz（低频）
      └── 10-20Hz（高频）
 ```
 

@@ -21,32 +21,20 @@
 
 import os
 import argparse
+import subprocess
+import tempfile
+from math import gcd
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, filtfilt, find_peaks
-from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy.signal import butter, filtfilt, find_peaks, resample_poly
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.colors import LinearSegmentedColormap
-import warnings
-warnings.filterwarnings('ignore')
 
-# 尝试导入可选依赖
-try:
-    import librosa
-    HAS_LIBROSA = True
-except ImportError:
-    HAS_LIBROSA = False
-    print("[WARNING] librosa not installed. Audio processing will be disabled.")
-
-try:
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-    from sklearn.preprocessing import StandardScaler
-    import joblib
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
-    print("[WARNING] scikit-learn not installed. ML models will be disabled.")
+import soundfile as sf
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import average_precision_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import joblib
 
 # ============================================================================
 # [1] 配置参数类
@@ -62,7 +50,6 @@ class Config:
         self.das_fs = 2000           # DAS采样率 (Hz)
         self.das_bp_bands = [        # 多频带滤波配置
             (5, 10),                 # 主频带（用户指定）
-            (2, 5),                  # 低频补充
             (10, 20),                # 高频补充
         ]
         self.das_filter_order = 4
@@ -177,12 +164,60 @@ class AudioWeakLabelExtractor:
         self.config = config
         
     def load_audio(self, audio_path):
-        """加载音频文件"""
-        if not HAS_LIBROSA:
-            raise ImportError("librosa is required for audio processing. Install with: pip install librosa")
-        
-        y, sr = librosa.load(audio_path, sr=self.config.audio_sr, mono=True)
-        return y, sr
+        """加载音频文件并统一到目标采样率"""
+        audio_path = str(audio_path)
+        ext = os.path.splitext(audio_path)[1].lower()
+
+        # 对常见无损/有损音频格式直接读取；视频容器统一走ffmpeg抽取，避免依赖即将移除的audioread路径
+        direct_exts = {".wav", ".flac", ".ogg", ".aiff", ".aif", ".aifc", ".au", ".caf"}
+
+        if ext in direct_exts:
+            y, sr = self._read_mono_soundfile(audio_path)
+            y = self._resample_if_needed(y, sr, self.config.audio_sr)
+            return y, self.config.audio_sr
+
+        tmp_wav = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp_wav = f.name
+
+            cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-vn", "-ac", "1", "-ar", str(self.config.audio_sr),
+                tmp_wav,
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                msg = proc.stderr.strip().splitlines()
+                tail = "\n".join(msg[-8:]) if msg else "unknown ffmpeg error"
+                raise RuntimeError(
+                    "Failed to extract audio via ffmpeg. "
+                    "Please install ffmpeg or provide a WAV/FLAC audio file.\n"
+                    f"ffmpeg stderr tail:\n{tail}"
+                )
+
+            y, sr = self._read_mono_soundfile(tmp_wav)
+            y = self._resample_if_needed(y, sr, self.config.audio_sr)
+            return y, self.config.audio_sr
+        finally:
+            if tmp_wav and os.path.exists(tmp_wav):
+                os.remove(tmp_wav)
+
+    @staticmethod
+    def _read_mono_soundfile(path):
+        data, sr = sf.read(path, always_2d=True)
+        y = np.mean(data, axis=1).astype(np.float32)
+        return y, int(sr)
+
+    @staticmethod
+    def _resample_if_needed(y, src_sr, dst_sr):
+        if src_sr == dst_sr:
+            return y
+        g = gcd(int(src_sr), int(dst_sr))
+        up = int(dst_sr) // g
+        down = int(src_sr) // g
+        y_rs = resample_poly(y, up, down).astype(np.float32)
+        return y_rs
     
     def extract_envelope(self, y, sr):
         """提取带通滤波后的RMS包络"""
@@ -431,8 +466,102 @@ class WeaklySupervisedDetector:
     def __init__(self, config: Config):
         self.config = config
         self.model = None
-        self.scaler = StandardScaler() if HAS_SKLEARN else None
-        
+        self.scaler = StandardScaler()
+        self.last_eval_report = None
+        self.recommended_threshold = None
+
+    def _build_model(self):
+        """按配置构建分类器"""
+        if self.config.model_type == 'gb':
+            return GradientBoostingClassifier(
+                n_estimators=self.config.n_estimators,
+                max_depth=5,
+                random_state=42
+            )
+        return RandomForestClassifier(
+            n_estimators=self.config.n_estimators,
+            max_depth=10,
+            random_state=42,
+            n_jobs=1
+        )
+
+    def _run_validation_report(self, X, y):
+        """
+        训练前做一次轻量验证：
+        - 时间无关分层划分（默认 80/20）
+        - 输出 PR-AUC / Precision / Recall / F1
+        - 扫描阈值给出推荐值
+        """
+        self.last_eval_report = None
+        self.recommended_threshold = None
+
+        n_samples = len(y)
+        n_pos = int(np.sum(y == 1))
+        n_neg = int(np.sum(y == 0))
+        min_class = min(n_pos, n_neg)
+
+        print(f"[Eval] Samples={n_samples}, Pos={n_pos}, Neg={n_neg}")
+
+        if n_samples < 30 or min_class < 8:
+            print("[Eval] Skip validation: sample size too small for stable split")
+            return
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+
+        scaler_eval = StandardScaler()
+        X_train_scaled = scaler_eval.fit_transform(X_train)
+        X_val_scaled = scaler_eval.transform(X_val)
+
+        model_eval = self._build_model()
+        model_eval.fit(X_train_scaled, y_train)
+
+        val_probs = model_eval.predict_proba(X_val_scaled)[:, 1]
+        pr_auc = average_precision_score(y_val, val_probs)
+
+        thresholds = np.arange(0.30, 0.91, 0.05)
+        rows = []
+        best = None
+        best_key = (-1.0, -1.0, -1.0, 0.0)  # F1, Precision, Recall, -|thr-0.5|
+
+        print("[Eval] Validation metrics by threshold:")
+        print("       thr    P      R      F1")
+        for thr in thresholds:
+            y_pred = (val_probs >= thr).astype(np.int32)
+            p = precision_score(y_val, y_pred, zero_division=0)
+            r = recall_score(y_val, y_pred, zero_division=0)
+            f1 = f1_score(y_val, y_pred, zero_division=0)
+            rows.append({'threshold': float(thr), 'precision': float(p), 'recall': float(r), 'f1': float(f1)})
+            print(f"       {thr:0.2f}  {p:0.3f}  {r:0.3f}  {f1:0.3f}")
+
+            key = (f1, p, r, -abs(float(thr) - 0.5))
+            if key > best_key:
+                best_key = key
+                best = rows[-1]
+
+        if best is None:
+            return
+
+        self.recommended_threshold = float(best['threshold'])
+        self.last_eval_report = {
+            'n_samples': int(n_samples),
+            'n_pos': int(n_pos),
+            'n_neg': int(n_neg),
+            'pr_auc': float(pr_auc),
+            'best_threshold': float(best['threshold']),
+            'best_precision': float(best['precision']),
+            'best_recall': float(best['recall']),
+            'best_f1': float(best['f1']),
+            'grid': rows,
+        }
+
+        print(f"[Eval] PR-AUC={pr_auc:.4f}")
+        print(f"[Eval] Best threshold={best['threshold']:.2f} (P={best['precision']:.3f}, "
+              f"R={best['recall']:.3f}, F1={best['f1']:.3f})")
+        print(f"[Eval] Current confidence_threshold={self.config.confidence_threshold:.2f}")
+        print(f"[Eval] Suggestion: try --confidence_threshold {best['threshold']:.2f}")
+
     def prepare_training_data(self, das_bands, audio_step_times, 
                               neg_ratio=3.0, time_range=None):
         """
@@ -490,26 +619,14 @@ class WeaklySupervisedDetector:
     
     def train(self, X, y):
         """训练模型"""
-        if not HAS_SKLEARN:
-            raise ImportError("scikit-learn is required for model training")
+        # 在正式训练前输出一份验证指标报告（不改变最终训练行为）
+        self._run_validation_report(X, y)
         
         # 标准化
         X_scaled = self.scaler.fit_transform(X)
         
         # 选择模型
-        if self.config.model_type == 'gb':
-            self.model = GradientBoostingClassifier(
-                n_estimators=self.config.n_estimators,
-                max_depth=5,
-                random_state=42
-            )
-        else:
-            self.model = RandomForestClassifier(
-                n_estimators=self.config.n_estimators,
-                max_depth=10,
-                random_state=42,
-                n_jobs=-1
-            )
+        self.model = self._build_model()
         
         self.model.fit(X_scaled, y)
         
@@ -567,13 +684,11 @@ class WeaklySupervisedDetector:
         if self.model is None:
             raise ValueError("No model to save. Train the model first.")
         
-        if not HAS_SKLEARN:
-            raise ImportError("scikit-learn is required for model saving")
-        
         # 保存模型和标准化器以及配置
         model_data = {
             'model': self.model,
             'scaler': self.scaler,
+            'recommended_threshold': self.recommended_threshold,
             'config': {
                 'das_fs': self.config.das_fs,
                 'das_bp_bands': self.config.das_bp_bands,
@@ -602,9 +717,6 @@ class WeaklySupervisedDetector:
         Returns:
             WeaklySupervisedDetector: 加载好模型的检测器实例
         """
-        if not HAS_SKLEARN:
-            raise ImportError("scikit-learn is required for model loading")
-        
         print(f"[Model] Loading from: {model_path}")
         model_data = joblib.load(model_path)
         
@@ -622,10 +734,13 @@ class WeaklySupervisedDetector:
         detector = cls(config)
         detector.model = model_data['model']
         detector.scaler = model_data['scaler']
+        detector.recommended_threshold = model_data.get('recommended_threshold', None)
         
         print(f"[Model] Loaded successfully (version: {model_data.get('version', 'unknown')})")
         print(f"[Model] Config: DAS {saved_config.get('das_bp_bands', 'N/A')}, "
               f"model_type={saved_config.get('model_type', 'N/A')}")
+        if detector.recommended_threshold is not None:
+            print(f"[Model] Recommended threshold from training: {detector.recommended_threshold:.2f}")
         
         return detector
 
@@ -994,39 +1109,22 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     print(f"[DAS] Energy matrix shape: {energy_matrix.shape}")
     
     # ===== 2. 处理音频，提取弱标签 =====
-    if load_model_path:
-        # 如果加载模型，音频是可选的（用于对比）
-        if HAS_LIBROSA and audio_path:
-            audio_extractor = AudioWeakLabelExtractor(config)
-            audio_result = audio_extractor.process_audio(
-                audio_path, 
-                trim_start=config.trim_start_s,
-                trim_end=config.trim_end_s
-            )
-            audio_step_times = audio_result['step_times'] + align_dt
-        else:
-            audio_step_times = np.array([])
-            audio_result = {'envelope': None, 'step_times': np.array([])}
-    elif HAS_LIBROSA and audio_path:
+    audio_result = {'envelope': None, 'step_times': np.array([])}
+    audio_step_times = np.array([])
+    if audio_path:
         audio_extractor = AudioWeakLabelExtractor(config)
         audio_result = audio_extractor.process_audio(
-            audio_path, 
+            audio_path,
             trim_start=config.trim_start_s,
             trim_end=config.trim_end_s
         )
-        
-        # 应用时间对齐
         audio_step_times = audio_result['step_times'] + align_dt
-        
         print(f"[Audio] Step candidates (after alignment): {len(audio_step_times)}")
-    else:
-        print("[WARNING] No audio processing - using energy-based detection only")
-        # 使用纯能量检测作为后备
-        audio_step_times = _fallback_energy_detection(das_5_10, config)
-        audio_result = {'envelope': None, 'step_times': audio_step_times}
     
     # ===== 3. 训练或加载弱监督模型 =====
-    if load_model_path and os.path.exists(load_model_path):
+    if load_model_path:
+        if not os.path.exists(load_model_path):
+            raise FileNotFoundError(f"Model file not found: {load_model_path}")
         # 加载已有模型
         print(f"\n[Model] Loading pre-trained model from: {load_model_path}")
         detector = WeaklySupervisedDetector.load_model(load_model_path, config)
@@ -1040,7 +1138,12 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
         )
         
         print(f"[Model] Detected {len(step_times_detected)} steps using loaded model")
-    elif HAS_SKLEARN and len(audio_step_times) > 5:
+    else:
+        if not audio_path:
+            raise ValueError("Training mode requires --audio. For model-only inference use --load_model with --inference_only.")
+        if len(audio_step_times) <= 5:
+            raise ValueError(f"Too few audio weak labels ({len(audio_step_times)}). Check audio quality or trim range.")
+
         print("\n[Model] Starting weakly supervised training...")
         
         # 初始训练
@@ -1076,12 +1179,6 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
         # 保存训练好的模型
         if save_model_path:
             detector.save_model(save_model_path)
-    else:
-        print("[WARNING] Using simple energy-based detection (no ML)")
-        step_times_detected = audio_step_times
-        step_probs = np.ones(len(step_times_detected)) * 0.7
-        grid_times = frame_times
-        probs = np.zeros(len(frame_times))
     
     # ===== 4. 估计通道位置 =====
     step_events = []
@@ -1147,39 +1244,6 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
         print(f"Channel range: {df_out['channel'].min()} - {df_out['channel'].max()}")
     
     return step_events, energy_matrix, frame_times
-
-
-def _fallback_energy_detection(das_filtered, config):
-    """后备的纯能量检测（无音频时使用）"""
-    fs = config.das_fs
-    
-    # 计算总能量曲线
-    win = int(0.05 * fs)  # 50ms窗口
-    step = int(0.01 * fs)  # 10ms步长
-    
-    T, C = das_filtered.shape
-    energy_curve = []
-    times = []
-    
-    for start in range(0, T - win, step):
-        window = das_filtered[start:start + win, :]
-        e = np.sum(window ** 2)
-        energy_curve.append(e)
-        times.append((start + win // 2) / fs)
-    
-    energy_curve = np.array(energy_curve)
-    times = np.array(times)
-    
-    # 对数Z-score
-    log_e = np.log(energy_curve + 1e-12)
-    z = robust_zscore(log_e)
-    
-    # 峰值检测
-    min_dist = int(config.step_min_interval / (step / fs))
-    peaks, _ = find_peaks(z, distance=min_dist, height=1.0, prominence=0.5)
-    
-    return times[peaks]
-
 
 # ============================================================================
 # [9] 命令行接口
