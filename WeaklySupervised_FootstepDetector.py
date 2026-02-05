@@ -77,7 +77,7 @@ class Config:
         self.audio_smooth_ms = 30    # 包络平滑窗口 (ms)
         
         # ===== 脚步检测参数 =====
-        self.step_min_interval = 0.30   # 最小脚步间隔 (秒)
+        self.step_min_interval = 0.45   # 最小脚步间隔 (秒)
         self.audio_peak_prom = 1.5      # 峰值显著性阈值
         self.audio_peak_height = 0.8    # 峰值高度阈值
         
@@ -92,8 +92,8 @@ class Config:
         # ===== 模型参数 =====
         self.model_type = 'auto'        # auto: 有CUDA用cnn，否则用rf
         self.n_estimators = 100
-        self.self_train_rounds = 3      # 自训练轮数
-        self.confidence_threshold = 0.7 # 高置信预测阈值
+        self.self_train_rounds = 0      # 自训练轮数
+        self.confidence_threshold = 0.75 # 高置信预测阈值
         self.device = 'auto'            # 'auto'/'cuda'/'cpu'
         self.torch_epochs = 40
         self.torch_batch_size = 64
@@ -1050,7 +1050,7 @@ class WeaklySupervisedDetector:
             probs = self.model.predict_proba(X_scaled)[:, 1]
             return valid_times, probs
     
-    def detect_steps_from_probs(self, times, probs, threshold=0.5, min_interval=0.25):
+    def detect_steps_from_probs(self, times, probs, threshold=0.75, min_interval=0.45):
         """从概率曲线中检测脚步事件"""
         # 峰值检测
         dt = np.median(np.diff(times)) if len(times) > 1 else 0.05
@@ -1552,7 +1552,7 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
         grid_times, probs = detector.predict_on_grid(das_bands, time_step=0.03)
         step_times_detected, step_probs = detector.detect_steps_from_probs(
             grid_times, probs,
-            threshold=0.5,
+            threshold=config.confidence_threshold,
             min_interval=config.step_min_interval
         )
         
@@ -1574,7 +1574,7 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
         grid_times, probs = detector.predict_on_grid(das_bands, time_step=0.03)
         step_times_detected, step_probs = detector.detect_steps_from_probs(
             grid_times, probs,
-            threshold=0.5,
+            threshold=config.confidence_threshold,
             min_interval=config.step_min_interval
         )
         
@@ -1591,7 +1591,7 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
             # 最终检测
             step_times_detected, step_probs = detector.detect_steps_from_probs(
                 grid_times, probs,
-                threshold=0.5,
+                threshold=config.confidence_threshold,
                 min_interval=config.step_min_interval
             )
         
@@ -1712,10 +1712,10 @@ Examples:
     parser.add_argument('--model_type', type=str, default='auto',
                         choices=['auto', 'rf', 'cnn'],
                         help='模型类型：auto/rf/cnn；auto=有CUDA用cnn，无CUDA用rf')
-    parser.add_argument('--self_train_rounds', type=int, default=3,
-                        help='自训练迭代轮数，默认3')
-    parser.add_argument('--confidence_threshold', type=float, default=0.7,
-                        help='高置信预测阈值，默认0.7')
+    parser.add_argument('--self_train_rounds', type=int, default=0,
+                        help='自训练迭代轮数，默认0')
+    parser.add_argument('--confidence_threshold', type=float, default=0.75,
+                        help='高置信预测阈值，默认0.75')
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
                         help='深度模型设备选择，默认auto')
@@ -1857,7 +1857,7 @@ def run_inference_only(das_csv, model_path, config):
     # 检测脚步
     step_times_detected, step_probs = detector.detect_steps_from_probs(
         grid_times, probs, 
-        threshold=0.5,
+        threshold=config.confidence_threshold,
         min_interval=config.step_min_interval
     )
     

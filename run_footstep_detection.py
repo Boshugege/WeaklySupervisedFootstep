@@ -71,12 +71,12 @@ DETECTION_CONFIG = {
     "audio_bp_high": 10000,             # 音频带通高频（你指定的10kHz）
     
     # 脚步检测参数
-    "step_min_interval": 0.30,          # 最小脚步间隔（秒）
+    "step_min_interval": 0.45,          # 最小脚步间隔（秒）
     "weak_label_sigma": 0.15,           # 弱标签时间扩展sigma
     
     # 模型参数
-    "self_train_rounds": 3,             # 自训练轮数
-    "confidence_threshold": 0.6,        # 高置信阈值
+    "self_train_rounds": 0,             # 自训练轮数
+    "confidence_threshold": 0.75,       # 高置信阈值
 }
 
 

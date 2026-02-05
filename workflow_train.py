@@ -89,10 +89,10 @@ def parse_args():
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "cuda", "cpu"],
                         help="深度模型设备，默认 auto")
-    parser.add_argument("--self_train_rounds", type=int, default=3,
-                        help="自训练迭代轮数，默认 3")
-    parser.add_argument("--confidence_threshold", type=float, default=0.5,
-                        help="高置信预测阈值，默认 0.5")
+    parser.add_argument("--self_train_rounds", type=int, default=0,
+                        help="自训练迭代轮数，默认 0")
+    parser.add_argument("--confidence_threshold", type=float, default=0.75,
+                        help="高置信预测阈值，默认 0.75")
     parser.add_argument("--torch_epochs", type=int, default=40,
                         help="深度模型训练轮数，默认 40")
     parser.add_argument("--torch_batch_size", type=int, default=64,
