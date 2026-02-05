@@ -788,6 +788,34 @@ class TorchBinaryClassifier:
         y = np.asarray(y).astype(np.int32)
         return float(np.mean(pred == y))
 
+    def export_learned_pattern(self, output_png_path):
+        """导出CNN首层卷积中最强滤波器对应的时空pattern。"""
+        if self.model is None:
+            raise ValueError("Torch model not trained.")
+        first_conv = self.model.net[0]
+        if not isinstance(first_conv, nn.Conv2d):
+            raise ValueError("Unexpected model structure: first layer is not Conv2d.")
+
+        w = first_conv.weight.detach().cpu().numpy()  # [out_ch, in_bands, kh, kw]
+        filt_norm = np.linalg.norm(w.reshape(w.shape[0], -1), axis=1)
+        best_idx = int(np.argmax(filt_norm))
+        pattern = np.mean(w[best_idx], axis=0)  # [kh, kw], 跨频带平均
+
+        npy_path = os.path.splitext(output_png_path)[0] + ".npy"
+        np.save(npy_path, pattern)
+
+        fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+        im = ax.imshow(pattern, cmap='RdBu_r', aspect='auto')
+        ax.set_title(f"Learned Pattern (conv1 #{best_idx})")
+        ax.set_xlabel("Channel Kernel Axis")
+        ax.set_ylabel("Time Kernel Axis")
+        plt.colorbar(im, ax=ax, shrink=0.8)
+        plt.tight_layout()
+        plt.savefig(output_png_path, dpi=180, bbox_inches='tight')
+        plt.close(fig)
+        print(f"[Viz] Saved learned pattern: {output_png_path}")
+        print(f"[Viz] Saved learned pattern array: {npy_path}")
+
     def to_serializable(self):
         if self.model is None or self.input_shape is None:
             raise ValueError("Torch model not trained.")
@@ -1062,6 +1090,13 @@ class WeaklySupervisedDetector:
         step_probs = probs[peaks]
         
         return step_times, step_probs
+
+    def export_learned_pattern(self, output_png_path):
+        if isinstance(self.model, TorchBinaryClassifier):
+            self.model.export_learned_pattern(output_png_path)
+            return True
+        print("[Viz] Learned pattern export skipped: current model is not CNN.")
+        return False
     
     def save_model(self, model_path):
         """
@@ -1625,6 +1660,10 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     # 通道轨迹图
     trajectory_path = os.path.join(config.output_dir, f"{base_name}_channel_trajectory.png")
     viz.plot_channel_trajectory(step_events, trajectory_path)
+
+    # 导出模型学习到的pattern（仅CNN模型）
+    pattern_path = os.path.join(config.output_dir, f"{base_name}_learned_pattern.png")
+    detector.export_learned_pattern(pattern_path)
     
     # 对比图
     if audio_result['envelope'] is not None:
@@ -1881,6 +1920,10 @@ def run_inference_only(das_csv, model_path, config):
     # 通道轨迹图
     trajectory_path = os.path.join(config.output_dir, f"{base_name}_trajectory_inference.png")
     viz.plot_channel_trajectory(step_events, trajectory_path)
+
+    # 导出模型学习到的pattern（仅CNN模型）
+    pattern_path = os.path.join(config.output_dir, f"{base_name}_learned_pattern_inference.png")
+    detector.export_learned_pattern(pattern_path)
     
     # ===== 6. 输出CSV =====
     csv_output_path = os.path.join(config.output_dir, f"{base_name}_steps_inference.csv")
