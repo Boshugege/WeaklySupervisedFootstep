@@ -708,7 +708,8 @@ class TorchBinaryClassifier:
             weight_decay=self.config.torch_weight_decay,
         )
         use_amp = bool(getattr(self.config, "torch_amp", True)) and (self.device.type == "cuda")
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        amp_device = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        scaler = torch.amp.GradScaler(amp_device, enabled=use_amp)
         val_interval = max(1, int(getattr(self.config, "torch_val_interval", 5)))
 
         best_state = None
@@ -724,7 +725,7 @@ class TorchBinaryClassifier:
                 xb = xb.to(self.device)
                 yb = yb.to(self.device)
                 optimizer.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast(amp_device, enabled=use_amp):
                     logits = self.model(xb)
                     loss = criterion(logits, yb)
                 scaler.scale(loss).backward()
@@ -745,7 +746,7 @@ class TorchBinaryClassifier:
                 for xb, yb in val_loader:
                     xb = xb.to(self.device)
                     yb = yb.to(self.device)
-                    with torch.cuda.amp.autocast(enabled=use_amp):
+                    with torch.amp.autocast(amp_device, enabled=use_amp):
                         logits = self.model(xb)
                     val_losses.append(float(criterion(logits, yb).item()))
             mean_val = float(np.mean(val_losses)) if val_losses else np.inf
@@ -792,9 +793,13 @@ class TorchBinaryClassifier:
         """导出CNN首层卷积中最强滤波器对应的时空pattern。"""
         if self.model is None:
             raise ValueError("Torch model not trained.")
-        first_conv = self.model.net[0]
-        if not isinstance(first_conv, nn.Conv2d):
-            raise ValueError("Unexpected model structure: first layer is not Conv2d.")
+        first_conv = None
+        for m in self.model.modules():
+            if isinstance(m, nn.Conv2d):
+                first_conv = m
+                break
+        if first_conv is None:
+            raise ValueError("Unexpected model structure: no Conv2d layer found.")
 
         w = first_conv.weight.detach().cpu().numpy()  # [out_ch, in_bands, kh, kw]
         filt_norm = np.linalg.norm(w.reshape(w.shape[0], -1), axis=1)
@@ -959,7 +964,7 @@ class WeaklySupervisedDetector:
         print(f"[Eval] Suggestion: try --confidence_threshold {best['threshold']:.2f}")
 
     def prepare_training_data(self, das_bands, audio_step_times, 
-                              neg_ratio=3.0, time_range=None):
+                              neg_ratio=4.0, time_range=None):
         """
         准备训练数据
         - 正样本：音频检测到的脚步时间点附近
@@ -975,23 +980,36 @@ class WeaklySupervisedDetector:
         pos_times = audio_step_times[(audio_step_times >= t_min) & 
                                       (audio_step_times <= t_max)]
         
-        # 生成负样本时间（远离正样本）
-        min_dist = self.config.step_min_interval * 1.5
-        all_times = np.arange(t_min + 0.5, t_max - 0.5, 0.1)
+        # 生成负样本时间（包含 hard negatives + easy negatives）
+        # 旧逻辑使用过大的排除半径，容易导致负样本过少。
+        exclude_radius = max(0.08, self.config.step_min_interval * 0.45)
+        hard_upper = max(exclude_radius + 0.05, self.config.step_min_interval * 1.2)
+        all_times = np.arange(t_min + 0.35, t_max - 0.35, 0.03)
+
+        if len(pos_times) == 0:
+            neg_times = all_times
+        else:
+            pos_sorted = np.sort(pos_times)
+            idx = np.searchsorted(pos_sorted, all_times)
+            left_d = np.where(idx > 0, np.abs(all_times - pos_sorted[np.clip(idx - 1, 0, len(pos_sorted) - 1)]), np.inf)
+            right_d = np.where(idx < len(pos_sorted), np.abs(pos_sorted[np.clip(idx, 0, len(pos_sorted) - 1)] - all_times), np.inf)
+            min_d = np.minimum(left_d, right_d)
+
+            hard_pool = all_times[(min_d >= exclude_radius) & (min_d <= hard_upper)]
+            easy_pool = all_times[min_d > hard_upper]
+
+            n_neg_target = int(max(len(pos_times) * neg_ratio, 120))
+            n_hard = min(len(hard_pool), int(n_neg_target * 0.6))
+            n_easy = min(len(easy_pool), n_neg_target - n_hard)
+
+            hard_sel = np.random.choice(hard_pool, n_hard, replace=False) if n_hard > 0 else np.array([])
+            easy_sel = np.random.choice(easy_pool, n_easy, replace=False) if n_easy > 0 else np.array([])
+            neg_times = np.sort(np.concatenate([hard_sel, easy_sel]))
         
-        neg_times = []
-        for t in all_times:
-            if len(pos_times) == 0 or np.min(np.abs(t - pos_times)) > min_dist:
-                neg_times.append(t)
-        neg_times = np.array(neg_times)
-        
-        # 采样负样本
-        n_neg = min(len(neg_times), int(len(pos_times) * neg_ratio))
-        if n_neg > 0:
-            neg_idx = np.random.choice(len(neg_times), n_neg, replace=False)
-            neg_times = neg_times[neg_idx]
-        
-        print(f"[Train] Positive samples: {len(pos_times)}, Negative samples: {len(neg_times)}")
+        print(
+            f"[Train] Positive samples: {len(pos_times)}, Negative samples: {len(neg_times)} "
+            f"(neg_ratio={neg_ratio}, exclude_radius={exclude_radius:.2f}s)"
+        )
         
         model_type = self._effective_model_type()
 
