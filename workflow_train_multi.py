@@ -105,10 +105,22 @@ def parse_args():
                         help=f"DAS采样率 (Hz)，默认 {DEFAULT_DAS_FS}")
     
     # 训练参数
+    parser.add_argument("--model_type", type=str, default="auto",
+                        choices=["auto", "rf", "cnn"],
+                        help="模型类型，默认 auto（有CUDA跑cnn，无CUDA跑rf）")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cuda", "cpu"],
+                        help="深度模型设备，默认 auto")
     parser.add_argument("--self_train_rounds", type=int, default=3,
                         help="自训练迭代轮数，默认 3")
-    parser.add_argument("--confidence_threshold", type=float, default=0.7,
-                        help="高置信预测阈值，默认 0.7")
+    parser.add_argument("--confidence_threshold", type=float, default=0.5,
+                        help="高置信预测阈值，默认 0.5")
+    parser.add_argument("--torch_epochs", type=int, default=40,
+                        help="深度模型训练轮数，默认 40")
+    parser.add_argument("--torch_batch_size", type=int, default=256,
+                        help="深度模型batch大小，默认 256")
+    parser.add_argument("--torch_lr", type=float, default=1e-3,
+                        help="深度模型学习率，默认 1e-3")
     
     # 输出控制
     parser.add_argument("--model_name", type=str, default=None,
@@ -300,6 +312,7 @@ def main():
         print(f"时间裁剪: 按表单 {trim_profile_path.name}（缺省 头部 -{DEFAULT_TRIM_HEAD}s, 尾部 -{DEFAULT_TRIM_TAIL}s）")
     print(f"跳过通道: 前 {args.skip_channels} 个")
     print(f"DAS采样率: {args.das_fs} Hz")
+    print(f"模型: {args.model_type} (device={args.device})")
     print(f"模型名称: {model_name}")
     
     # ===== 1. 检查输入文件 =====
@@ -459,6 +472,11 @@ def main():
         "--trim_start", "0",  # 已经裁剪过了
         "--trim_end", str(merged_duration),  # 合并后的总时长
         "--das_fs", str(args.das_fs),
+        "--model_type", str(args.model_type),
+        "--device", str(args.device),
+        "--torch_epochs", str(args.torch_epochs),
+        "--torch_batch_size", str(args.torch_batch_size),
+        "--torch_lr", str(args.torch_lr),
         "--self_train_rounds", str(args.self_train_rounds),
         "--confidence_threshold", str(args.confidence_threshold),
         "--output_dir", str(results_output_dir),

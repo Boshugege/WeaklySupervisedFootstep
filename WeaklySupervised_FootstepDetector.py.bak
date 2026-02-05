@@ -102,8 +102,6 @@ class Config:
         self.torch_hidden_dim = 128
         self.torch_dropout = 0.1
         self.torch_patience = 8
-        self.cnn_window_s = 0.2
-        self.cnn_predict_chunk = 256
         
         # ===== 输出参数 =====
         self.output_dir = 'output/weakly_supervised'
@@ -437,33 +435,6 @@ class DASFeatureExtractor:
             valid_times.append(t)
         
         return np.array(features_list), np.array(valid_times)
-
-    def extract_cnn_windows_at_times(self, das_bands, sample_times, window_s=0.2):
-        """为CNN提取原始时空窗口，输出 [N, B, W, C]。"""
-        fs = self.config.das_fs
-        half_win = int(window_s * fs / 2)
-        band_keys = sorted(das_bands.keys())
-
-        windows = []
-        valid_times = []
-        for t in sample_times:
-            t_idx = int(t * fs)
-            start = max(0, t_idx - half_win)
-            end = min(das_bands[band_keys[0]].shape[0], t_idx + half_win)
-            if end - start < 2 * half_win:
-                continue
-
-            band_windows = []
-            for key in band_keys:
-                w = das_bands[key][start:end, :].astype(np.float32)
-                band_windows.append(w)
-            x = np.stack(band_windows, axis=0)  # [B, W, C]
-            windows.append(x)
-            valid_times.append(t)
-
-        if not windows:
-            return np.empty((0, len(band_keys), 2 * half_win, 0), dtype=np.float32), np.array([])
-        return np.stack(windows, axis=0), np.array(valid_times)
     
     def estimate_channel_for_time(self, das_filtered, t, window_s=0.15):
         """估计指定时间点最可能的脚步通道"""
@@ -525,54 +496,48 @@ def _resolve_torch_device(device_pref: str):
 
 
 class FeatureCNN(nn.Module):
-    """直接对DAS时空窗口做2D卷积二分类。"""
-    def __init__(self, in_bands: int, hidden_dim: int = 128, dropout: float = 0.1):
+    """对结构化特征做1D卷积二分类。"""
+    def __init__(self, input_dim: int, hidden_dim: int = 128, dropout: float = 0.1):
         super().__init__()
-        c1 = max(16, hidden_dim // 8)
-        c2 = max(32, hidden_dim // 4)
-        c3 = max(64, hidden_dim // 2)
+        c1 = max(16, hidden_dim // 4)
+        c2 = max(32, hidden_dim // 2)
         self.net = nn.Sequential(
-            nn.Conv2d(in_bands, c1, kernel_size=(7, 7), padding=(3, 3)),
+            nn.Conv1d(1, c1, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(c1),
-            nn.MaxPool2d(kernel_size=(2, 2)),
-            nn.Conv2d(c1, c2, kernel_size=(5, 5), padding=(2, 2)),
+            nn.BatchNorm1d(c1),
+            nn.Conv1d(c1, c2, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(c2),
-            nn.MaxPool2d(kernel_size=(2, 2)),
-            nn.Conv2d(c2, c3, kernel_size=(3, 3), padding=(1, 1)),
-            nn.ReLU(),
-            nn.BatchNorm2d(c3),
-            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.BatchNorm1d(c2),
+            nn.AdaptiveAvgPool1d(1),
         )
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(c3, hidden_dim),
+            nn.Linear(c2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
-        self.in_bands = in_bands
+        self.input_dim = input_dim
 
     def forward(self, x):
+        x = x.unsqueeze(1)
         x = self.net(x)
         return self.head(x).squeeze(1)
 
 
 class TorchBinaryClassifier:
     """提供与sklearn兼容接口的PyTorch二分类包装器。"""
-    def __init__(self, config: Config, input_shape=None):
+    def __init__(self, config: Config, input_dim: int = None):
         self.config = config
         self.model_kind = 'cnn'
-        self.input_shape = input_shape
+        self.input_dim = input_dim
         self.device = _resolve_torch_device(config.device)
         self.model = None
         self.best_val_loss = None
 
-    def _build_network(self, input_shape):
-        in_bands = int(input_shape[0])
+    def _build_network(self, input_dim: int):
         return FeatureCNN(
-            in_bands=in_bands,
+            input_dim=input_dim,
             hidden_dim=self.config.torch_hidden_dim,
             dropout=self.config.torch_dropout,
         )
@@ -580,8 +545,8 @@ class TorchBinaryClassifier:
     def fit(self, X, y):
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
-        self.input_shape = tuple(X.shape[1:])
-        self.model = self._build_network(self.input_shape).to(self.device)
+        self.input_dim = int(X.shape[1])
+        self.model = self._build_network(self.input_dim).to(self.device)
 
         X_train, X_val, y_train, y_val = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y.astype(np.int32)
@@ -605,7 +570,7 @@ class TorchBinaryClassifier:
         best_state = None
         best_val = np.inf
         wait = 0
-        print(f"[Torch] model={self.model_kind}, device={self.device}, input_shape={self.input_shape}")
+        print(f"[Torch] model={self.model_kind}, device={self.device}, input_dim={self.input_dim}")
         for epoch in range(1, self.config.torch_epochs + 1):
             self.model.train()
             for xb, yb in train_loader:
@@ -667,11 +632,11 @@ class TorchBinaryClassifier:
         return float(np.mean(pred == y))
 
     def to_serializable(self):
-        if self.model is None or self.input_shape is None:
+        if self.model is None or self.input_dim is None:
             raise ValueError("Torch model not trained.")
         return {
             'model_kind': self.model_kind,
-            'input_shape': [int(x) for x in self.input_shape],
+            'input_dim': int(self.input_dim),
             'state_dict': {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             'best_val_loss': None if self.best_val_loss is None else float(self.best_val_loss),
         }
@@ -681,9 +646,9 @@ class TorchBinaryClassifier:
         model_kind = artifact.get('model_kind', 'cnn')
         if model_kind != 'cnn':
             raise ValueError(f"Unsupported saved torch model_kind: {model_kind}")
-        input_shape = tuple(artifact.get('input_shape', [2, 400, 174]))
-        obj = cls(config=config, input_shape=input_shape)
-        obj.model = obj._build_network(input_shape).to(obj.device)
+        input_dim = int(artifact['input_dim'])
+        obj = cls(config=config, input_dim=input_dim)
+        obj.model = obj._build_network(input_dim).to(obj.device)
         obj.model.load_state_dict(artifact['state_dict'])
         obj.model.eval()
         obj.best_val_loss = artifact.get('best_val_loss')
@@ -700,7 +665,8 @@ class WeaklySupervisedDetector:
         self.last_eval_report = None
         self.recommended_threshold = None
 
-    def _effective_model_type(self):
+    def _build_model(self):
+        """按配置构建分类器"""
         has_cuda = TORCH_AVAILABLE and torch.cuda.is_available()
         selected = self.config.model_type
         if selected == 'auto':
@@ -708,11 +674,6 @@ class WeaklySupervisedDetector:
         elif selected == 'cnn' and not has_cuda:
             print("[Model] CUDA不可用，自动回退到rf")
             selected = 'rf'
-        return selected
-
-    def _build_model(self):
-        """按配置构建分类器"""
-        selected = self._effective_model_type()
 
         if selected == 'cnn':
             return TorchBinaryClassifier(self.config)
@@ -749,16 +710,15 @@ class WeaklySupervisedDetector:
         X_train, X_val, y_train, y_val = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
+
+        scaler_eval = StandardScaler()
+        X_train_scaled = scaler_eval.fit_transform(X_train)
+        X_val_scaled = scaler_eval.transform(X_val)
+
         model_eval = self._build_model()
-        if self._effective_model_type() == 'cnn':
-            model_eval.fit(X_train, y_train)
-            val_probs = model_eval.predict_proba(X_val)[:, 1]
-        else:
-            scaler_eval = StandardScaler()
-            X_train_scaled = scaler_eval.fit_transform(X_train)
-            X_val_scaled = scaler_eval.transform(X_val)
-            model_eval.fit(X_train_scaled, y_train)
-            val_probs = model_eval.predict_proba(X_val_scaled)[:, 1]
+        model_eval.fit(X_train_scaled, y_train)
+
+        val_probs = model_eval.predict_proba(X_val_scaled)[:, 1]
         pr_auc = average_precision_score(y_val, val_probs)
 
         thresholds = np.arange(0.30, 0.91, 0.05)
@@ -838,25 +798,19 @@ class WeaklySupervisedDetector:
         
         print(f"[Train] Positive samples: {len(pos_times)}, Negative samples: {len(neg_times)}")
         
-        model_type = self._effective_model_type()
-
-        # 提取特征/窗口
+        # 提取特征
         das_extractor = DASFeatureExtractor(self.config)
-        if model_type == 'cnn':
-            pos_x, _ = das_extractor.extract_cnn_windows_at_times(
-                das_bands, pos_times, window_s=self.config.cnn_window_s)
-            neg_x, _ = das_extractor.extract_cnn_windows_at_times(
-                das_bands, neg_times, window_s=self.config.cnn_window_s)
-            X = np.concatenate([pos_x, neg_x], axis=0)
-            y = np.concatenate([np.ones(len(pos_x)), np.zeros(len(neg_x))])
-        else:
-            pos_features, _ = das_extractor.extract_features_at_times(
-                das_bands, pos_times, window_s=0.2)
-            neg_features, _ = das_extractor.extract_features_at_times(
-                das_bands, neg_times, window_s=0.2)
-            X = np.vstack([pos_features, neg_features])
-            y = np.concatenate([np.ones(len(pos_features)), np.zeros(len(neg_features))])
-
+        
+        pos_features, pos_valid = das_extractor.extract_features_at_times(
+            das_bands, pos_times, window_s=0.2)
+        neg_features, neg_valid = das_extractor.extract_features_at_times(
+            das_bands, neg_times, window_s=0.2)
+        
+        # 合并
+        X = np.vstack([pos_features, neg_features])
+        y = np.concatenate([np.ones(len(pos_features)), 
+                           np.zeros(len(neg_features))])
+        
         # 打乱
         perm = np.random.permutation(len(y))
         X = X[perm]
@@ -868,19 +822,17 @@ class WeaklySupervisedDetector:
         """训练模型"""
         # 在正式训练前输出一份验证指标报告（不改变最终训练行为）
         self._run_validation_report(X, y)
-
+        
+        # 标准化
+        X_scaled = self.scaler.fit_transform(X)
+        
         # 选择模型
         self.model = self._build_model()
-
-        if isinstance(self.model, TorchBinaryClassifier):
-            self.model.fit(X, y)
-            train_acc = self.model.score(X, y)
-        else:
-            X_scaled = self.scaler.fit_transform(X)
-            self.model.fit(X_scaled, y)
-            train_acc = self.model.score(X_scaled, y)
-
+        
+        self.model.fit(X_scaled, y)
+        
         # 训练集准确率
+        train_acc = self.model.score(X_scaled, y)
         print(f"[Train] Training accuracy: {train_acc:.4f}")
         
         return self.model
@@ -898,30 +850,17 @@ class WeaklySupervisedDetector:
         grid_times = np.arange(t_min, t_max, time_step)
         
         das_extractor = DASFeatureExtractor(self.config)
-        if isinstance(self.model, TorchBinaryClassifier):
-            chunk = max(32, int(self.config.cnn_predict_chunk))
-            all_times = []
-            all_probs = []
-            for i in range(0, len(grid_times), chunk):
-                batch_times = grid_times[i:i + chunk]
-                windows, valid_times = das_extractor.extract_cnn_windows_at_times(
-                    das_bands, batch_times, window_s=self.config.cnn_window_s)
-                if len(windows) == 0:
-                    continue
-                probs = self.model.predict_proba(windows)[:, 1]
-                all_times.append(valid_times)
-                all_probs.append(probs)
-            if not all_times:
-                return np.array([]), np.array([])
-            return np.concatenate(all_times), np.concatenate(all_probs)
-        else:
-            features, valid_times = das_extractor.extract_features_at_times(
-                das_bands, grid_times, window_s=0.2)
-            if len(features) == 0:
-                return np.array([]), np.array([])
-            X_scaled = self.scaler.transform(features)
-            probs = self.model.predict_proba(X_scaled)[:, 1]
-            return valid_times, probs
+        features, valid_times = das_extractor.extract_features_at_times(
+            das_bands, grid_times, window_s=0.2)
+        
+        if len(features) == 0:
+            return np.array([]), np.array([])
+        
+        # 预测
+        X_scaled = self.scaler.transform(features)
+        probs = self.model.predict_proba(X_scaled)[:, 1]
+        
+        return valid_times, probs
     
     def detect_steps_from_probs(self, times, probs, threshold=0.5, min_interval=0.25):
         """从概率曲线中检测脚步事件"""
@@ -979,8 +918,6 @@ class WeaklySupervisedDetector:
                 'torch_hidden_dim': self.config.torch_hidden_dim,
                 'torch_dropout': self.config.torch_dropout,
                 'torch_patience': self.config.torch_patience,
-                'cnn_window_s': self.config.cnn_window_s,
-                'cnn_predict_chunk': self.config.cnn_predict_chunk,
             },
             'version': '2.0'
         }
@@ -1600,10 +1537,6 @@ Examples:
                         help='深度模型隐藏维度，默认128')
     parser.add_argument('--torch_dropout', type=float, default=0.1,
                         help='深度模型dropout，默认0.1')
-    parser.add_argument('--cnn_window_s', type=float, default=0.2,
-                        help='CNN输入窗口时长（秒），默认0.2')
-    parser.add_argument('--cnn_predict_chunk', type=int, default=256,
-                        help='CNN网格预测分块大小，默认256')
     
     # 输出参数
     parser.add_argument('--output_dir', '-o', default=None,
@@ -1645,10 +1578,6 @@ def main():
         config.torch_hidden_dim = args.torch_hidden_dim
     if args.torch_dropout is not None:
         config.torch_dropout = args.torch_dropout
-    if args.cnn_window_s is not None:
-        config.cnn_window_s = args.cnn_window_s
-    if args.cnn_predict_chunk is not None:
-        config.cnn_predict_chunk = args.cnn_predict_chunk
     
     # ===== 仅推理模式 =====
     if args.inference_only:
