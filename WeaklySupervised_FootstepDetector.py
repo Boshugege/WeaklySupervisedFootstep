@@ -524,30 +524,109 @@ def _resolve_torch_device(device_pref: str):
     return torch.device('cpu')
 
 
+class TemporalBlock(nn.Module):
+    """时间维度残差块 - 捕捉振动的时序模式"""
+    def __init__(self, channels: int, kernel_size: int = 3, dilation: int = 1):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation // 2
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=(kernel_size, 1), 
+                      padding=(padding, 0), dilation=(dilation, 1)),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=(kernel_size, 1), 
+                      padding=(padding, 0), dilation=(dilation, 1)),
+            nn.BatchNorm2d(channels),
+        )
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        return self.relu(x + self.conv(x))
+
+
+class SpatialBlock(nn.Module):
+    """空间维度残差块 - 捕捉相邻通道的振动关联"""
+    def __init__(self, channels: int, kernel_size: int = 3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=(1, kernel_size), 
+                      padding=(0, padding)),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, kernel_size=(1, kernel_size), 
+                      padding=(0, padding)),
+            nn.BatchNorm2d(channels),
+        )
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        return self.relu(x + self.conv(x))
+
+
 class FeatureCNN(nn.Module):
-    """直接对DAS时空窗口做2D卷积二分类。"""
+    """
+    改进版CNN - 直接学习振动模式而非只关注能量
+    
+    设计原则:
+    1. 使用小卷积核(3x3)捕捉局部振动波形
+    2. 分离时间和空间卷积，分别学习振动序列和通道关联
+    3. 使用残差连接保留原始波形信息
+    4. 减少池化操作，用stride卷积逐步降采样
+    5. 多尺度时序特征提取（不同dilation）
+    """
     def __init__(self, in_bands: int, hidden_dim: int = 128, dropout: float = 0.1):
         super().__init__()
-        c1 = max(16, hidden_dim // 8)
-        c2 = max(32, hidden_dim // 4)
-        c3 = max(64, hidden_dim // 2)
-        self.net = nn.Sequential(
-            nn.Conv2d(in_bands, c1, kernel_size=(7, 7), padding=(3, 3)),
-            nn.ReLU(),
+        c1 = max(32, hidden_dim // 4)
+        c2 = max(64, hidden_dim // 2)
+        c3 = max(128, hidden_dim)
+        
+        # 初始特征提取 - 小卷积核保留振动细节
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_bands, c1, kernel_size=(3, 3), padding=(1, 1)),
             nn.BatchNorm2d(c1),
-            nn.MaxPool2d(kernel_size=(2, 2)),
-            nn.Conv2d(c1, c2, kernel_size=(5, 5), padding=(2, 2)),
             nn.ReLU(),
-            nn.BatchNorm2d(c2),
-            nn.MaxPool2d(kernel_size=(2, 2)),
-            nn.Conv2d(c2, c3, kernel_size=(3, 3), padding=(1, 1)),
-            nn.ReLU(),
-            nn.BatchNorm2d(c3),
-            nn.AdaptiveAvgPool2d((1, 1)),
         )
+        
+        # 多尺度时序振动模式学习（不同dilation捕捉不同时间尺度的振动）
+        self.temporal_blocks = nn.ModuleList([
+            TemporalBlock(c1, kernel_size=3, dilation=1),  # 短期振动
+            TemporalBlock(c1, kernel_size=3, dilation=2),  # 中期振动
+            TemporalBlock(c1, kernel_size=3, dilation=4),  # 长期振动模式
+        ])
+        
+        # 空间降采样（stride=2，比MaxPool更平滑）
+        self.downsample1 = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(),
+        )
+        
+        # 空间关联学习 - 相邻通道的振动关联
+        self.spatial_blocks = nn.ModuleList([
+            SpatialBlock(c2, kernel_size=3),
+            SpatialBlock(c2, kernel_size=5),  # 更大范围的通道关联
+        ])
+        
+        # 进一步特征压缩
+        self.downsample2 = nn.Sequential(
+            nn.Conv2d(c2, c3, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)),
+            nn.BatchNorm2d(c3),
+            nn.ReLU(),
+        )
+        
+        # 最终特征聚合 - 保留时间和空间维度的统计量
+        # 不使用(1,1)全局池化，而是分别计算时间和空间统计
+        self.temporal_pool = nn.AdaptiveAvgPool2d((4, 1))  # 保留4个时间点
+        self.spatial_pool = nn.AdaptiveAvgPool2d((1, 4))   # 保留4个通道
+        
+        # 分类头 - 更大的隐藏层保留信息
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(c3, hidden_dim),
+            nn.Linear(c3 * 4 + c3 * 4, hidden_dim * 2),  # 时间+空间特征
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -555,8 +634,33 @@ class FeatureCNN(nn.Module):
         self.in_bands = in_bands
 
     def forward(self, x):
-        x = self.net(x)
-        return self.head(x).squeeze(1)
+        # 初始特征
+        x = self.stem(x)
+        
+        # 多尺度时序振动模式
+        for block in self.temporal_blocks:
+            x = block(x)
+        
+        # 降采样
+        x = self.downsample1(x)
+        
+        # 空间关联
+        for block in self.spatial_blocks:
+            x = block(x)
+        
+        # 进一步压缩
+        x = self.downsample2(x)
+        
+        # 分别提取时间和空间统计特征
+        t_feat = self.temporal_pool(x)  # [B, C, 4, 1]
+        s_feat = self.spatial_pool(x)   # [B, C, 1, 4]
+        
+        # 拼接时空特征
+        t_flat = t_feat.view(t_feat.size(0), -1)
+        s_flat = s_feat.view(s_feat.size(0), -1)
+        combined = torch.cat([t_flat, s_flat], dim=1)
+        
+        return self.head(combined).squeeze(1)
 
 
 class TorchBinaryClassifier:
