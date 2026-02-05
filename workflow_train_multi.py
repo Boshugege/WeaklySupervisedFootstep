@@ -113,8 +113,8 @@ def parse_args():
                         help="深度模型设备，默认 auto")
     parser.add_argument("--self_train_rounds", type=int, default=0,
                         help="自训练迭代轮数，默认 0")
-    parser.add_argument("--confidence_threshold", type=float, default=0.75,
-                        help="高置信预测阈值，默认 0.75")
+    parser.add_argument("--confidence_threshold", type=float, default=0.35,
+                        help="高置信预测阈值，默认 0.35")
     parser.add_argument("--torch_epochs", type=int, default=40,
                         help="深度模型训练轮数，默认 40")
     parser.add_argument("--torch_batch_size", type=int, default=64,

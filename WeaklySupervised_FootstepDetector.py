@@ -93,7 +93,8 @@ class Config:
         self.model_type = 'auto'        # auto: 有CUDA用cnn，否则用rf
         self.n_estimators = 100
         self.self_train_rounds = 0      # 自训练轮数
-        self.confidence_threshold = 0.75 # 高置信预测阈值
+        self.confidence_threshold = 0.35 # 高置信预测阈值
+        self.prob_smooth_points = 3      # 概率曲线平滑窗口点数（>=1）
         self.device = 'auto'            # 'auto'/'cuda'/'cpu'
         self.torch_epochs = 40
         self.torch_batch_size = 64
@@ -1096,16 +1097,24 @@ class WeaklySupervisedDetector:
             probs = self.model.predict_proba(X_scaled)[:, 1]
             return valid_times, probs
     
-    def detect_steps_from_probs(self, times, probs, threshold=0.75, min_interval=0.45):
+    def detect_steps_from_probs(self, times, probs, threshold=0.35, min_interval=0.45):
         """从概率曲线中检测脚步事件"""
+        probs = np.asarray(probs, dtype=np.float64)
+        smooth_points = int(max(1, getattr(self.config, "prob_smooth_points", 1)))
+        if smooth_points > 1 and len(probs) >= smooth_points:
+            kernel = np.ones(smooth_points, dtype=np.float64) / float(smooth_points)
+            probs_used = np.convolve(probs, kernel, mode='same')
+        else:
+            probs_used = probs
+
         # 峰值检测
         dt = np.median(np.diff(times)) if len(times) > 1 else 0.05
         min_dist = max(1, int(min_interval / dt))
         
-        peaks, props = find_peaks(probs, distance=min_dist, height=threshold)
+        peaks, props = find_peaks(probs_used, distance=min_dist, height=threshold)
         
         step_times = times[peaks]
-        step_probs = probs[peaks]
+        step_probs = probs_used[peaks]
         
         return step_times, step_probs
 
@@ -1161,6 +1170,7 @@ class WeaklySupervisedDetector:
                 'torch_patience': self.config.torch_patience,
                 'torch_val_interval': self.config.torch_val_interval,
                 'torch_amp': self.config.torch_amp,
+                'prob_smooth_points': self.config.prob_smooth_points,
                 'cnn_window_s': self.config.cnn_window_s,
                 'cnn_predict_chunk': self.config.cnn_predict_chunk,
             },
@@ -1771,8 +1781,8 @@ Examples:
                         help='模型类型：auto/rf/cnn；auto=有CUDA用cnn，无CUDA用rf')
     parser.add_argument('--self_train_rounds', type=int, default=0,
                         help='自训练迭代轮数，默认0')
-    parser.add_argument('--confidence_threshold', type=float, default=0.75,
-                        help='高置信预测阈值，默认0.75')
+    parser.add_argument('--confidence_threshold', type=float, default=0.35,
+                        help='高置信预测阈值，默认0.35')
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
                         help='深度模型设备选择，默认auto')

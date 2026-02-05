@@ -76,7 +76,7 @@ DETECTION_CONFIG = {
     
     # 模型参数
     "self_train_rounds": 0,             # 自训练轮数
-    "confidence_threshold": 0.75,       # 高置信阈值
+    "confidence_threshold": 0.35,       # 高置信阈值
 }
 
 
