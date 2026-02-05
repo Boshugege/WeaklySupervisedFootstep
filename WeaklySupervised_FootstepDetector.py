@@ -95,7 +95,7 @@ class Config:
         self.self_train_rounds = 3      # 自训练轮数
         self.confidence_threshold = 0.7 # 高置信预测阈值
         self.device = 'auto'            # 'auto'/'cuda'/'cpu'
-        self.torch_epochs = 50
+        self.torch_epochs = 200
         self.torch_batch_size = 256
         self.torch_lr = 1e-3
         self.torch_weight_decay = 1e-4
