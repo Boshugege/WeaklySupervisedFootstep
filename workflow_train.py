@@ -201,7 +201,7 @@ def main():
     else:
         extract_cmd = [
             sys.executable, str(SCRIPT_DIR / "extract_name_signals_from_tdms.py"),
-            "--video-dir", str(VIDEO_DIR),
+            "--video-dir", str(AUDIO_DIR),  # 使用Audio目录（无video支持）
             "--airtag-csv-dir", str(AIRTAG_DIR),
             "--tdms-dir", str(DAS_DIR),
             "--output-dir", str(csv_output_dir),
@@ -209,6 +209,7 @@ def main():
             "--csv-utc-offset-hours", str(DEFAULT_UTC_OFFSET),
             "--name", name,
             "--skip-channels", str(args.skip_channels),
+            "--use-airtag-only",  # 从Airtag获取目标名
         ]
         if args.overwrite:
             extract_cmd.append("--overwrite")

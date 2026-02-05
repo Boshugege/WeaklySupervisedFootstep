@@ -95,7 +95,7 @@ class Config:
         self.self_train_rounds = 3      # 自训练轮数
         self.confidence_threshold = 0.7 # 高置信预测阈值
         self.device = 'auto'            # 'auto'/'cuda'/'cpu'
-        self.torch_epochs = 200
+        self.torch_epochs = 40
         self.torch_batch_size = 256
         self.torch_lr = 1e-3
         self.torch_weight_decay = 1e-4
@@ -809,9 +809,14 @@ class WeaklySupervisedDetector:
         selected = self.config.model_type
         if selected == 'auto':
             selected = 'cnn' if has_cuda else 'rf'
+            print(f"[Model] Auto-selecting model: {'CNN (CUDA available)' if has_cuda else 'RandomForest (no CUDA)'}")
         elif selected == 'cnn' and not has_cuda:
             print("[Model] CUDA不可用，自动回退到rf")
             selected = 'rf'
+        elif selected == 'cnn' and has_cuda:
+            print("[Model] Using CNN with CUDA")
+        elif selected == 'rf':
+            print("[Model] Using RandomForest")
         return selected
 
     def _build_model(self):
