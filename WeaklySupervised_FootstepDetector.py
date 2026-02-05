@@ -96,13 +96,15 @@ class Config:
         self.confidence_threshold = 0.7 # 高置信预测阈值
         self.device = 'auto'            # 'auto'/'cuda'/'cpu'
         self.torch_epochs = 40
-        self.torch_batch_size = 256
+        self.torch_batch_size = 64
         self.torch_lr = 1e-3
         self.torch_weight_decay = 1e-4
-        self.torch_hidden_dim = 128
+        self.torch_hidden_dim = 64
         self.torch_dropout = 0.1
         self.torch_patience = 8
-        self.cnn_window_s = 0.2
+        self.torch_val_interval = 5
+        self.torch_amp = True
+        self.cnn_window_s = 0.12
         self.cnn_predict_chunk = 256
         
         # ===== 输出参数 =====
@@ -705,21 +707,37 @@ class TorchBinaryClassifier:
             lr=self.config.torch_lr,
             weight_decay=self.config.torch_weight_decay,
         )
+        use_amp = bool(getattr(self.config, "torch_amp", True)) and (self.device.type == "cuda")
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        val_interval = max(1, int(getattr(self.config, "torch_val_interval", 5)))
 
         best_state = None
         best_val = np.inf
         wait = 0
-        print(f"[Torch] model={self.model_kind}, device={self.device}, input_shape={self.input_shape}")
+        print(
+            f"[Torch] model={self.model_kind}, device={self.device}, input_shape={self.input_shape}, "
+            f"amp={use_amp}, val_interval={val_interval}"
+        )
         for epoch in range(1, self.config.torch_epochs + 1):
             self.model.train()
             for xb, yb in train_loader:
                 xb = xb.to(self.device)
                 yb = yb.to(self.device)
                 optimizer.zero_grad(set_to_none=True)
-                logits = self.model(xb)
-                loss = criterion(logits, yb)
-                loss.backward()
-                optimizer.step()
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    logits = self.model(xb)
+                    loss = criterion(logits, yb)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+            should_validate = (
+                epoch == 1
+                or epoch % val_interval == 0
+                or epoch == self.config.torch_epochs
+            )
+            if not should_validate:
+                continue
 
             self.model.eval()
             val_losses = []
@@ -727,11 +745,11 @@ class TorchBinaryClassifier:
                 for xb, yb in val_loader:
                     xb = xb.to(self.device)
                     yb = yb.to(self.device)
-                    logits = self.model(xb)
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        logits = self.model(xb)
                     val_losses.append(float(criterion(logits, yb).item()))
             mean_val = float(np.mean(val_losses)) if val_losses else np.inf
-            if epoch == 1 or epoch % 5 == 0:
-                print(f"[Torch] Epoch {epoch:03d}/{self.config.torch_epochs} val_loss={mean_val:.4f}")
+            print(f"[Torch] Epoch {epoch:03d}/{self.config.torch_epochs} val_loss={mean_val:.4f}")
 
             if mean_val < best_val - 1e-5:
                 best_val = mean_val
@@ -1088,6 +1106,8 @@ class WeaklySupervisedDetector:
                 'torch_hidden_dim': self.config.torch_hidden_dim,
                 'torch_dropout': self.config.torch_dropout,
                 'torch_patience': self.config.torch_patience,
+                'torch_val_interval': self.config.torch_val_interval,
+                'torch_amp': self.config.torch_amp,
                 'cnn_window_s': self.config.cnn_window_s,
                 'cnn_predict_chunk': self.config.cnn_predict_chunk,
             },
@@ -1701,16 +1721,16 @@ Examples:
                         help='深度模型设备选择，默认auto')
     parser.add_argument('--torch_epochs', type=int, default=50,
                         help='深度模型训练轮数，默认50')
-    parser.add_argument('--torch_batch_size', type=int, default=256,
-                        help='深度模型batch大小，默认256')
+    parser.add_argument('--torch_batch_size', type=int, default=64,
+                        help='深度模型batch大小，默认64')
     parser.add_argument('--torch_lr', type=float, default=1e-3,
                         help='深度模型学习率，默认1e-3')
-    parser.add_argument('--torch_hidden_dim', type=int, default=128,
-                        help='深度模型隐藏维度，默认128')
+    parser.add_argument('--torch_hidden_dim', type=int, default=64,
+                        help='深度模型隐藏维度，默认64')
     parser.add_argument('--torch_dropout', type=float, default=0.1,
                         help='深度模型dropout，默认0.1')
-    parser.add_argument('--cnn_window_s', type=float, default=0.2,
-                        help='CNN输入窗口时长（秒），默认0.2')
+    parser.add_argument('--cnn_window_s', type=float, default=0.12,
+                        help='CNN输入窗口时长（秒），默认0.12')
     parser.add_argument('--cnn_predict_chunk', type=int, default=256,
                         help='CNN网格预测分块大小，默认256')
     

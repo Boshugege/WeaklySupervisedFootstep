@@ -117,8 +117,8 @@ def parse_args():
                         help="高置信预测阈值，默认 0.5")
     parser.add_argument("--torch_epochs", type=int, default=40,
                         help="深度模型训练轮数，默认 40")
-    parser.add_argument("--torch_batch_size", type=int, default=256,
-                        help="深度模型batch大小，默认 256")
+    parser.add_argument("--torch_batch_size", type=int, default=64,
+                        help="深度模型batch大小，默认 64")
     parser.add_argument("--torch_lr", type=float, default=1e-3,
                         help="深度模型学习率，默认 1e-3")
     
