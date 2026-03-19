@@ -10,6 +10,7 @@
     python workflow_train.py wangdihai
     python workflow_train.py wangdihai --trim_head 50 --trim_tail 20
     python workflow_train.py wangdihai --skip_channels 15
+    python workflow_train.py wangdihai --output_dir custom_output
 """
 
 import argparse
@@ -61,6 +62,12 @@ def parse_args():
 
   # 跳过信号提取（已有CSV）
   python workflow_train.py wangdihai --skip_extract
+
+    # 显式指定DAS滤波方法（默认 sosfilt）
+    python workflow_train.py wangdihai --das_filter_method sosfilt
+
+    # 指定输出根目录
+    python workflow_train.py wangdihai --output_dir custom_output
         """
     )
     
@@ -81,6 +88,8 @@ def parse_args():
     # 采样率
     parser.add_argument("--das_fs", type=int, default=DEFAULT_DAS_FS,
                         help=f"DAS采样率 (Hz)，默认 {DEFAULT_DAS_FS}")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help=f"输出根目录（默认 {OUTPUT_BASE_DIR}）")
     
     # 训练参数
     parser.add_argument("--model_type", type=str, default="auto",
@@ -91,14 +100,17 @@ def parse_args():
                         help="深度模型设备，默认 auto")
     parser.add_argument("--self_train_rounds", type=int, default=0,
                         help="自训练迭代轮数，默认 0")
-    parser.add_argument("--confidence_threshold", type=float, default=0.35,
-                        help="高置信预测阈值，默认 0.35")
-    parser.add_argument("--torch_epochs", type=int, default=40,
-                        help="深度模型训练轮数，默认 40")
-    parser.add_argument("--torch_batch_size", type=int, default=64,
-                        help="深度模型batch大小，默认 64")
-    parser.add_argument("--torch_lr", type=float, default=1e-3,
+    parser.add_argument("--confidence_threshold", type=float, default=0.45,
+                        help="高置信预测阈值，默认 0.4")
+    parser.add_argument("--torch_epochs", type=int, default=50,
+                        help="深度模型训练轮数，默认 50")
+    parser.add_argument("--torch_batch_size", type=int, default=128,
+                        help="深度模型batch大小，默认 128")
+    parser.add_argument("--torch_lr", type=float, default=1e-4,
                         help="深度模型学习率，默认 1e-3")
+    parser.add_argument("--das_filter_method", type=str, default="sosfilt",
+                        choices=["filtfilt", "sosfilt"],
+                        help="DAS带通滤波方法，默认 sosfilt")
     
     # 控制选项
     parser.add_argument("--skip_extract", action="store_true",
@@ -107,6 +119,8 @@ def parse_args():
                         help="覆盖已存在的输出文件")
     parser.add_argument("--dry_run", action="store_true",
                         help="仅打印将要执行的命令，不实际运行")
+    parser.add_argument("--disable_das_bandpass", action="store_true",
+                        help="关闭DAS带通滤波，直接用原始DAS信号训练")
     
     return parser.parse_args()
 
@@ -149,6 +163,13 @@ def run_command(cmd: list, description: str, dry_run: bool = False) -> int:
 def main():
     args = parse_args()
     name = args.name.lower()  # 统一小写
+
+    if args.output_dir:
+        output_base_dir = Path(args.output_dir)
+        if not output_base_dir.is_absolute():
+            output_base_dir = SCRIPT_DIR / output_base_dir
+    else:
+        output_base_dir = OUTPUT_BASE_DIR
     
     print("="*60)
     print("脚步检测训练工作流")
@@ -181,7 +202,7 @@ def main():
     print(f"  ✓ DAS目录: {DAS_DIR}")
     
     # ===== 2. 设置输出路径 =====
-    output_dir = OUTPUT_BASE_DIR / name
+    output_dir = output_base_dir / name
     csv_output_dir = output_dir / "signals"
     model_output_dir = output_dir / "models"
     results_output_dir = output_dir / "results"
@@ -189,7 +210,8 @@ def main():
     das_csv_path = csv_output_dir / f"{name}.csv"
     model_path = model_output_dir / f"{name}_model.joblib"
     
-    print(f"\n[OUTPUT] 输出目录: {output_dir}")
+    print(f"\n[OUTPUT] 输出根目录: {output_base_dir}")
+    print(f"[OUTPUT] 输出目录: {output_dir}")
     
     # ===== 3. 提取DAS信号 =====
     # 智能跳过：如果CSV已存在且未指定--overwrite，自动跳过提取
@@ -265,11 +287,14 @@ def main():
         "--torch_epochs", str(args.torch_epochs),
         "--torch_batch_size", str(args.torch_batch_size),
         "--torch_lr", str(args.torch_lr),
+        "--das_filter_method", str(args.das_filter_method),
         "--self_train_rounds", str(args.self_train_rounds),
         "--confidence_threshold", str(args.confidence_threshold),
         "--output_dir", str(results_output_dir),
         "--save_model", str(model_path),
     ]
+    if args.disable_das_bandpass:
+        train_cmd.append("--disable_das_bandpass")
     
     ret = run_command(train_cmd, "训练弱监督脚步检测模型", args.dry_run)
     if ret != 0:

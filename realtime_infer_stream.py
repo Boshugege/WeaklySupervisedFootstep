@@ -49,10 +49,12 @@ def _parse_args(argv=None):
     p.add_argument("--trim-head", type=float, default=50.0, help="Trim seconds from start.")
     p.add_argument("--trim-tail", type=float, default=20.0, help="Trim seconds from end.")
     p.add_argument("--csv-utc-offset-hours", type=float, default=8.0, help="Airtag CSV UTC offset (hours).")
-    p.add_argument("--chunk-seconds", type=float, default=0.25, help="Chunk duration (s).")
+    p.add_argument("--chunk-seconds", type=float, default=1.0, help="Chunk duration (s).")
     p.add_argument("--time-step", type=float, default=0.03, help="Grid step for inference (s).")
-    p.add_argument("--buffer-seconds", type=float, default=5.0, help="Ring buffer size (s).")
-    p.add_argument("--latency-seconds", type=float, default=0.8, help="Event output latency (s).")
+    p.add_argument("--buffer-seconds", type=float, default=10.0, help="Ring buffer size (s), <=0 keeps all probs.")
+    p.add_argument("--latency-seconds", type=float, default=1.0, help="Event output latency (s).")
+    p.add_argument("--detrend-alpha", type=float, default=0.001,
+                   help="EMA detrend factor before bandpass (online approximation of global de-mean).")
     p.add_argument("--speed", type=float, default=1.0, help="Simulation speed (1.0 = real-time, 0 = no sleep).")
     p.add_argument("--max-seconds", type=float, default=None, help="Max seconds to stream (optional).")
     p.add_argument("--protocol", choices=["udp", "tcp"], default="udp", help="Stream protocol.")
@@ -245,6 +247,28 @@ class OnlineBandpass:
         return out
 
 
+class OnlineDetrender:
+    def __init__(self, n_channels, alpha=0.001):
+        self.n_channels = int(n_channels)
+        self.alpha = float(min(1.0, max(1e-6, alpha)))
+        self.mean = np.zeros((self.n_channels,), dtype=np.float64)
+        self.initialized = False
+
+    def transform_chunk(self, x):
+        x = np.asarray(x, dtype=np.float64)
+        if x.ndim != 2 or x.shape[1] != self.n_channels:
+            return x
+        out = np.empty_like(x, dtype=np.float64)
+        if not self.initialized and x.shape[0] > 0:
+            self.mean[:] = x[0, :]
+            self.initialized = True
+        one_minus = 1.0 - self.alpha
+        for i in range(x.shape[0]):
+            self.mean = one_minus * self.mean + self.alpha * x[i, :]
+            out[i, :] = x[i, :] - self.mean
+        return out
+
+
 def estimate_channel(window):
     if window.size == 0:
         return 0, 0.5
@@ -295,6 +319,7 @@ def main(argv=None):
     config.das_fs = float(args.das_fs)
     config.model_type = "cnn"
     detector = load_torch_model(model_path, config)
+    primary_band = tuple(config.das_bp_bands[0])
 
     fs = float(args.das_fs)
     chunk_samples = max(1, int(args.chunk_seconds * fs))
@@ -306,6 +331,7 @@ def main(argv=None):
 
     total_channels = None
     bandpass = None
+    detrender = None
     band_buffers = {}
 
     prob_times = deque()
@@ -342,7 +368,9 @@ def main(argv=None):
 
             if total_channels is None:
                 total_channels = len(channels)
-                bandpass = OnlineBandpass(config.das_bp_bands, fs, config.das_filter_order, total_channels)
+                if not config.disable_das_bandpass:
+                    bandpass = OnlineBandpass(config.das_bp_bands, fs, config.das_filter_order, total_channels)
+                    detrender = OnlineDetrender(total_channels, alpha=args.detrend_alpha)
                 for band in config.das_bp_bands:
                     band_buffers[band] = RingBuffer(buffer_samples, total_channels, dtype=np.float32)
 
@@ -410,14 +438,18 @@ def main(argv=None):
                                 payload["sample_count"] = int(send_chunk.shape[0])
                         send_packet(sock, args.protocol, args.host, args.port, payload)
 
-                # Online bandpass filtering (remove per-chunk mean to match offline behavior)
-                x_for_filter = raw_chunk - np.mean(raw_chunk, axis=0, keepdims=True)
-                bands = bandpass.filter_chunk(x_for_filter)
+                # Online preprocessing: match training config (bandpass on/off)
+                if config.disable_das_bandpass:
+                    bands = {band: raw_chunk for band in config.das_bp_bands}
+                else:
+                    # continuous detrend (avoids chunk-boundary artifacts from per-chunk de-mean)
+                    x_for_filter = detrender.transform_chunk(raw_chunk)
+                    bands = bandpass.filter_chunk(x_for_filter)
                 for band, data in bands.items():
                     band_buffers[band].append(data.astype(np.float32))
 
                 # Online inference on grid times
-                latest_time = band_buffers[config.das_bp_bands[0]].total_written / fs - (config.cnn_window_s / 2.0)
+                latest_time = band_buffers[primary_band].total_written / fs - (config.cnn_window_s / 2.0)
                 if latest_time > next_grid_time:
                     grid_times = np.arange(next_grid_time, latest_time, time_step)
                     windows = []
@@ -453,9 +485,10 @@ def main(argv=None):
                 # Peak detection with fixed latency
                 global_written += (end - start)
                 current_time = global_written / fs
-                while prob_times and prob_times[0] < current_time - args.buffer_seconds:
-                    prob_times.popleft()
-                    prob_vals.popleft()
+                if args.buffer_seconds > 0:
+                    while prob_times and prob_times[0] < current_time - args.buffer_seconds:
+                        prob_times.popleft()
+                        prob_vals.popleft()
 
                 if len(prob_times) >= 3:
                     times = np.array(prob_times, dtype=np.float64)
@@ -477,13 +510,11 @@ def main(argv=None):
                         t = float(times[idx])
                         if t > current_time - latency:
                             continue
-                        if t <= last_emitted_time + config.step_min_interval * 0.5:
-                            continue
                         half_ch = int(0.15 * fs / 2)
                         center_idx = int(t * fs)
                         ch_start = center_idx - half_ch
                         ch_end = center_idx + half_ch
-                        w = band_buffers[(5, 10)].get_slice(ch_start, ch_end)
+                        w = band_buffers[primary_band].get_slice(ch_start, ch_end)
                         ch, ch_conf = estimate_channel(w)
                         event_payload = {
                             "packet_type": "event",

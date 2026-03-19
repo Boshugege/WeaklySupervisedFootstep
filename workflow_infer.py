@@ -12,9 +12,12 @@
 """
 
 import argparse
+import json
 import os
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # ============================================================================
@@ -41,6 +44,7 @@ DEFAULT_TRIM_TAIL = 20.0   # 从结尾裁掉20秒
 
 # 通道屏蔽默认值
 DEFAULT_SKIP_CHANNELS = 18  # 跳过前18个通道
+DOUBLE_CHUNK_SIZE = 20000  # 双人模拟分块行数，平衡内存与速度
 
 
 def parse_args():
@@ -63,6 +67,9 @@ def parse_args():
 
   # 跳过信号提取（已有CSV）
   python workflow_infer.py wangjiahui --model model.joblib --skip_extract
+
+    # 推理后按在线格式回放发送结果
+    python workflow_infer.py wangjiahui --model model.joblib --stream_after_infer --host 127.0.0.1 --port 9000
         """
     )
     
@@ -95,6 +102,35 @@ def parse_args():
                         help="覆盖已存在的输出文件")
     parser.add_argument("--dry_run", action="store_true",
                         help="仅打印将要执行的命令，不实际运行")
+    parser.add_argument("--disable_das_bandpass", action="store_true",
+                        help="关闭DAS带通滤波，直接使用原始DAS信号推理（建议与训练时设置一致）")
+    parser.add_argument("--das_filter_method", type=str, default="sosfilt",
+                        choices=["filtfilt", "sosfilt"],
+                        help="DAS带通滤波方法，默认 sosfilt")
+    parser.add_argument("--double", action="store_true",
+                        help="启用双人模拟：将DAS信号与其通道倒置版本逐点相加后再推理")
+    parser.add_argument("--mirror_only", action="store_true",
+                        help="仅使用通道镜像后的信号进行推理（不与原信号叠加）")
+    parser.add_argument("--channel_shift", type=int, default=0,
+                        help="对推理输入做通道偏移（正数向高通道移动，空位补0；默认0不偏移）")
+
+    # 推理后回放发送（在线同格式）
+    parser.add_argument("--stream_after_infer", action="store_true",
+                        help="离线推理完成后，按在线格式(signal/event)发送结果")
+    parser.add_argument("--protocol", choices=["udp", "tcp"], default="udp",
+                        help="回放发送协议，默认 udp")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="回放发送目标主机，默认 127.0.0.1")
+    parser.add_argument("--port", type=int, default=9000,
+                        help="回放发送目标端口，默认 9000")
+    parser.add_argument("--signal_downsample", type=int, default=1,
+                        help="发送signal包时降采样因子，默认 1")
+    parser.add_argument("--udp_max_samples", type=int, default=10,
+                        help="UDP每个signal包最大样本数，默认 10")
+    parser.add_argument("--udp_max_bytes", type=int, default=60000,
+                        help="UDP包最大字节数，默认 60000")
+    parser.add_argument("--replay_speed", type=float, default=0.0,
+                        help="回放速度（1.0=实时，0=不等待），默认 0")
     
     # 自定义路径
     parser.add_argument("--das_csv", type=str, default=None,
@@ -144,6 +180,230 @@ def run_command(cmd: list, description: str, dry_run: bool = False) -> int:
     return result.returncode
 
 
+def open_sender(protocol: str, host: str, port: int):
+    if protocol == "udp":
+        return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+    return sock
+
+
+def send_packet(sock, protocol: str, host: str, port: int, payload: dict):
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if protocol == "udp":
+        sock.sendto(data, (host, port))
+    else:
+        sock.sendall(data + b"\n")
+
+
+def stream_offline_results(args, das_csv_path: Path, steps_csv_path: Path, trim_start: float, trim_end: float):
+    import pandas as pd
+    import numpy as np
+
+    if not steps_csv_path.exists():
+        print(f"[WARN] 未找到steps结果文件，跳过回放发送: {steps_csv_path}")
+        return
+
+    print(f"\n[STREAM] 回放离线结果到 {args.protocol.upper()} {args.host}:{args.port}")
+
+    df_das = pd.read_csv(das_csv_path)
+    all_data = df_das.values.astype(np.float32)
+
+    start_idx = max(0, int(trim_start * args.das_fs))
+    end_idx = min(all_data.shape[0], int(trim_end * args.das_fs))
+    if end_idx <= start_idx:
+        print("[WARN] 回放区间为空，跳过发送")
+        return
+
+    replay_data = all_data[start_idx:end_idx, :]
+    total_channels = replay_data.shape[1]
+    channel_offset = max(0, int(args.skip_channels))
+
+    df_steps = pd.read_csv(steps_csv_path)
+    step_events = []
+    local_max_ch = -1
+    if not df_steps.empty and all(c in df_steps.columns for c in ["time", "channel", "confidence"]):
+        for _, row in df_steps.sort_values("time").iterrows():
+            ch = int(row["channel"])
+            local_max_ch = max(local_max_ch, ch)
+            step_events.append((float(row["time"]), ch, float(row["confidence"])))
+
+    if local_max_ch >= 0:
+        effective_channels = int(local_max_ch + 1)
+        inferred_tail_trim = max(0, int(total_channels - channel_offset - effective_channels))
+        global_max = channel_offset + effective_channels - 1
+        print(
+            f"[STREAM] 通道映射恢复: local[0..{local_max_ch}] -> global[{channel_offset}..{global_max}] "
+            f"(total={total_channels}, tail_trim={inferred_tail_trim})"
+        )
+    else:
+        print(f"[STREAM] 通道映射恢复: 无events，保持 total_channels={total_channels}")
+
+    sock = open_sender(args.protocol, args.host, args.port)
+    try:
+        event_ptr = 0
+        n = replay_data.shape[0]
+        down = max(1, int(args.signal_downsample))
+        udp_step = max(1, int(args.udp_max_samples))
+        replay_dt = 1.0 / float(args.das_fs)
+
+        for start in range(0, n, udp_step * down):
+            chunk = replay_data[start:start + udp_step * down:down, :]
+            if chunk.size == 0:
+                continue
+
+            sample_rate = float(args.das_fs) / down
+            ts = start / float(args.das_fs)
+
+            payload = {
+                "packet_type": "signal",
+                "timestamp": ts,
+                "sample_rate": sample_rate,
+                "sample_count": int(chunk.shape[0]),
+                "total_channels": int(total_channels),
+                "signals": chunk.tolist(),
+            }
+
+            if args.protocol == "udp" and args.udp_max_bytes and args.udp_max_bytes > 0:
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                if len(data) > args.udp_max_bytes:
+                    reduced = chunk[: max(1, int(chunk.shape[0] / 2)), :]
+                    payload["signals"] = reduced.tolist()
+                    payload["sample_count"] = int(reduced.shape[0])
+
+            send_packet(sock, args.protocol, args.host, args.port, payload)
+
+            window_end_t = (start + chunk.shape[0] * down) / float(args.das_fs)
+            while event_ptr < len(step_events) and step_events[event_ptr][0] < window_end_t:
+                t, ch, conf = step_events[event_ptr]
+                event_payload = {
+                    "packet_type": "event",
+                    "timestamp": float(t),
+                    "channel_index": int(ch + channel_offset),
+                    "confidence": float(conf),
+                }
+                send_packet(sock, args.protocol, args.host, args.port, event_payload)
+                event_ptr += 1
+
+            if args.replay_speed and args.replay_speed > 0:
+                time.sleep((chunk.shape[0] * down * replay_dt) / args.replay_speed)
+
+        while event_ptr < len(step_events):
+            t, ch, conf = step_events[event_ptr]
+            event_payload = {
+                "packet_type": "event",
+                "timestamp": float(t),
+                "channel_index": int(ch + channel_offset),
+                "confidence": float(conf),
+            }
+            send_packet(sock, args.protocol, args.host, args.port, event_payload)
+            event_ptr += 1
+
+        print(f"[STREAM] 已发送 signal + event（events={len(step_events)}）")
+    finally:
+        sock.close()
+
+
+def _compute_mirror_indices(columns: list):
+    import re
+
+    ch_pattern = re.compile(r"^ch_(\d+)$")
+    parsed_ids = []
+    for col in columns:
+        m = ch_pattern.match(str(col))
+        if not m:
+            return None, None
+        parsed_ids.append(int(m.group(1)))
+
+    if not parsed_ids:
+        return None, None
+
+    max_channel_id = max(parsed_ids)
+    id_to_idx = {ch_id: idx for idx, ch_id in enumerate(parsed_ids)}
+    mirror_indices = [id_to_idx.get(max_channel_id - ch_id, -1) for ch_id in parsed_ids]
+    return mirror_indices, max_channel_id
+
+
+def _apply_channel_shift(values, channel_shift: int):
+    import numpy as np
+
+    shift = int(channel_shift)
+    if shift == 0:
+        return values
+
+    n_channels = values.shape[1]
+    shifted = np.zeros_like(values)
+    if abs(shift) >= n_channels:
+        return shifted
+
+    if shift > 0:
+        shifted[:, shift:] = values[:, : n_channels - shift]
+    else:
+        k = -shift
+        shifted[:, : n_channels - k] = values[:, k:]
+    return shifted
+
+
+def build_augmented_csv(
+    src_csv_path: Path,
+    dst_csv_path: Path,
+    *,
+    do_double: bool,
+    do_mirror_only: bool,
+    channel_shift: int,
+    chunk_size: int = DOUBLE_CHUNK_SIZE,
+):
+    import pandas as pd
+
+    dst_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if dst_csv_path.exists():
+        dst_csv_path.unlink()
+
+    # 优先按全局通道号镜像（ch_k -> ch_(max_k - k)），避免 skip_channels 后简单翻转引起的通道位置偏移
+    col_df = pd.read_csv(src_csv_path, nrows=0)
+    columns = list(col_df.columns)
+    mirror_indices, max_channel_id = _compute_mirror_indices(columns)
+    if mirror_indices is not None:
+        print(
+            f"[AUG] 通道镜像映射: ch_k -> ch_{max_channel_id}-k "
+            f"(示例: {columns[0]} -> ch_{max_channel_id - int(str(columns[0]).split('_')[-1])})"
+        )
+    else:
+        print("[AUG] 通道镜像映射: 回退为列顺序反转（未检测到标准ch_x列名）")
+
+    print(f"[AUG] 变换配置: mirror_only={do_mirror_only}, double={do_double}, channel_shift={channel_shift}")
+
+    wrote = False
+    for chunk_df in pd.read_csv(src_csv_path, chunksize=chunk_size):
+        chunk_values = chunk_df.values.astype("float32", copy=False)
+
+        if mirror_indices is None:
+            mirrored_values = chunk_values[:, ::-1]
+        else:
+            mirrored_values = chunk_values.copy()
+            for dst_idx, src_idx in enumerate(mirror_indices):
+                if src_idx >= 0:
+                    mirrored_values[:, dst_idx] = chunk_values[:, src_idx]
+                else:
+                    mirrored_values[:, dst_idx] = 0.0
+
+        if do_mirror_only:
+            transformed_values = mirrored_values
+        elif do_double:
+            transformed_values = chunk_values + mirrored_values
+        else:
+            transformed_values = chunk_values
+
+        transformed_values = _apply_channel_shift(transformed_values, channel_shift)
+
+        out_df = pd.DataFrame(transformed_values, columns=chunk_df.columns)
+        out_df.to_csv(dst_csv_path, mode="a", header=not wrote, index=False)
+        wrote = True
+
+    if not wrote:
+        raise RuntimeError(f"输入CSV为空，无法构建双人模拟信号: {src_csv_path}")
+
+
 def main():
     args = parse_args()
     name = args.name.lower()  # 统一小写
@@ -156,7 +416,14 @@ def main():
     print(f"时间裁剪: 头部 -{args.trim_head}s, 尾部 -{args.trim_tail}s")
     print(f"跳过通道: 前 {args.skip_channels} 个")
     print(f"DAS采样率: {args.das_fs} Hz")
+    print(f"双人模拟: {'开启' if args.double else '关闭'}")
+    print(f"纯镜像: {'开启' if args.mirror_only else '关闭'}")
+    print(f"通道偏移: {args.channel_shift}")
     print(f"模式: {'带音频对比' if args.with_audio else '纯推理（无需音频）'}")
+
+    if args.double and args.mirror_only:
+        print("[ERROR] 参数冲突：--double 与 --mirror_only 不能同时开启")
+        return 1
     
     # ===== 1. 检查模型文件 =====
     model_path = Path(args.model)
@@ -267,15 +534,43 @@ def main():
         results_output_dir.mkdir(parents=True, exist_ok=True)
     
     # ===== 7. 运行推理 =====
+    infer_das_csv_path = das_csv_path
+    use_augmented_input = args.double or args.mirror_only or (int(args.channel_shift) != 0)
+    if use_augmented_input and not args.dry_run:
+        aug_suffix_parts = []
+        if args.mirror_only:
+            aug_suffix_parts.append("mirror")
+        elif args.double:
+            aug_suffix_parts.append("double")
+        if int(args.channel_shift) != 0:
+            shift = int(args.channel_shift)
+            aug_suffix_parts.append(f"shift{'p' if shift > 0 else 'm'}{abs(shift)}")
+
+        aug_suffix = "_".join(aug_suffix_parts)
+        augmented_csv_path = csv_output_dir / f"{das_csv_path.stem}_{aug_suffix}.csv"
+        print(f"\n[AUG] 构建增强信号: {augmented_csv_path}")
+        build_augmented_csv(
+            das_csv_path,
+            augmented_csv_path,
+            do_double=args.double,
+            do_mirror_only=args.mirror_only,
+            channel_shift=int(args.channel_shift),
+        )
+        infer_das_csv_path = augmented_csv_path
+        print(f"[AUG] 输入切换为增强信号: {infer_das_csv_path}")
+
     infer_cmd = [
         sys.executable, str(SCRIPT_DIR / "WeaklySupervised_FootstepDetector.py"),
-        "--das_csv", str(das_csv_path),
+        "--das_csv", str(infer_das_csv_path),
         "--trim_start", str(trim_start),
         "--trim_end", str(trim_end),
         "--das_fs", str(args.das_fs),
+        "--das_filter_method", str(args.das_filter_method),
         "--output_dir", str(results_output_dir),
         "--load_model", str(model_path),
     ]
+    if args.disable_das_bandpass:
+        infer_cmd.append("--disable_das_bandpass")
     
     if args.with_audio:
         # 带音频对比模式
@@ -294,12 +589,23 @@ def main():
     if ret != 0:
         print("[ABORT] 推理失败")
         return ret
+
+    # ===== 8. 按在线格式回放发送 =====
+    if args.stream_after_infer and not args.dry_run:
+        base_name = Path(infer_das_csv_path).stem
+        steps_infer_csv = results_output_dir / f"{base_name}_steps_inference.csv"
+        steps_default_csv = results_output_dir / f"{base_name}_steps.csv"
+        steps_csv_path = steps_infer_csv if steps_infer_csv.exists() else steps_default_csv
+        print(f"[STREAM] 使用事件文件: {steps_csv_path.name}")
+        stream_offline_results(args, infer_das_csv_path, steps_csv_path, trim_start, trim_end)
     
-    # ===== 8. 完成 =====
+    # ===== 9. 完成 =====
     print("\n" + "="*60)
     print("推理完成！")
     print("="*60)
     print(f"DAS信号CSV: {das_csv_path}")
+    if infer_das_csv_path != das_csv_path:
+        print(f"推理输入CSV: {infer_das_csv_path}")
     print(f"使用的模型: {model_path}")
     print(f"检测结果目录: {results_output_dir}")
     

@@ -26,7 +26,7 @@ import tempfile
 from math import gcd
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, filtfilt, find_peaks, resample_poly
+from scipy.signal import butter, filtfilt, sosfilt, find_peaks, resample_poly
 import matplotlib.pyplot as plt
 
 import soundfile as sf
@@ -63,10 +63,12 @@ class Config:
         # ===== DAS参数 =====
         self.das_fs = 2000           # DAS采样率 (Hz)
         self.das_bp_bands = [        # 多频带滤波配置
-            (5, 10),                 # 主频带（用户指定）
-            (10, 20),                # 高频补充
+            (5, 10),                # 主频带（用户指定）
+            (10, 50),                # 高频补充
         ]
         self.das_filter_order = 4
+        self.das_filter_method = 'filtfilt'  # 'filtfilt'（默认）或 'sosfilt'
+        self.disable_das_bandpass = False
         
         # ===== 音频参数 =====
         self.audio_sr = 48000        # 音频重采样率
@@ -77,35 +79,40 @@ class Config:
         self.audio_smooth_ms = 30    # 包络平滑窗口 (ms)
         
         # ===== 脚步检测参数 =====
-        self.step_min_interval = 0.45   # 最小脚步间隔 (秒)
+        self.step_min_interval = 0.5   # 最小脚步间隔 (秒)
         self.audio_peak_prom = 1.5      # 峰值显著性阈值
         self.audio_peak_height = 0.8    # 峰值高度阈值
         
         # ===== 弱标签参数 =====
-        self.weak_label_sigma = 0.15    # 弱标签高斯扩展sigma (秒)
+        self.weak_label_sigma = 0.18    # 弱标签高斯扩展sigma (秒)
         self.time_tolerance = 0.5       # 时间对齐容差 (秒)
         
         # ===== 特征提取参数 =====
         self.feature_win_ms = 100       # 特征窗口 (ms)
         self.feature_step_ms = 25       # 特征步长 (ms)
+
+        # ===== 路径级评估参数 =====
+        self.path_gap_s = 1.2           # 轨迹分段时间阈值 T_gap (s)
+        self.path_delta_c_max = 3       # 连续性阈值 Δc_max (ch)
+        self.path_eps_d = 1             # 方向死区 ε_d (ch)
         
         # ===== 模型参数 =====
         self.model_type = 'auto'        # auto: 有CUDA用cnn，否则用rf
         self.n_estimators = 100
         self.self_train_rounds = 0      # 自训练轮数
-        self.confidence_threshold = 0.35 # 高置信预测阈值
-        self.prob_smooth_points = 3      # 概率曲线平滑窗口点数（>=1）
+        self.confidence_threshold = 0.40 # 高置信预测阈值
+        self.prob_smooth_points = 4      # 概率曲线平滑窗口点数（>=1）
         self.device = 'auto'            # 'auto'/'cuda'/'cpu'
-        self.torch_epochs = 40
-        self.torch_batch_size = 64
-        self.torch_lr = 1e-3
+        self.torch_epochs = 50
+        self.torch_batch_size = 128
+        self.torch_lr = 1e-4
         self.torch_weight_decay = 1e-4
         self.torch_hidden_dim = 64
         self.torch_dropout = 0.1
         self.torch_patience = 8
         self.torch_val_interval = 5
         self.torch_amp = True
-        self.cnn_window_s = 0.12
+        self.cnn_window_s = 0.24
         self.cnn_predict_chunk = 256
         
         # ===== 输出参数 =====
@@ -119,6 +126,8 @@ class Config:
             self.trim_end_s = args.trim_end
         if args.das_fs is not None:
             self.das_fs = args.das_fs
+        if hasattr(args, 'das_filter_method') and args.das_filter_method is not None:
+            self.das_filter_method = str(args.das_filter_method)
         if args.audio_sr is not None:
             self.audio_sr = args.audio_sr
         if args.output_dir is not None:
@@ -141,20 +150,42 @@ def butter_bandpass(low, high, fs, order=4):
     return b, a
 
 
-def bandpass_filter(x, fs, low, high, order=4):
+def bandpass_filter(x, fs, low, high, order=4, method='filtfilt'):
     """一维带通滤波"""
-    b, a = butter_bandpass(low, high, fs, order=order)
-    return filtfilt(b, a, x - np.mean(x))
+    x0 = x - np.mean(x)
+    if method == 'filtfilt':
+        b, a = butter_bandpass(low, high, fs, order=order)
+        return filtfilt(b, a, x0)
+    if method == 'sosfilt':
+        nyq = 0.5 * fs
+        low_n = max(1e-6, low / nyq)
+        high_n = min(0.9999, high / nyq)
+        sos = butter(order, [low_n, high_n], btype='band', output='sos')
+        return sosfilt(sos, x0)
+    raise ValueError(f"Unsupported DAS filter method: {method}")
 
 
-def bandpass_filter_2d(X, fs, low, high, order=4):
+def bandpass_filter_2d(X, fs, low, high, order=4, method='filtfilt'):
     """对多通道信号 [T, C] 按列进行带通滤波"""
-    b, a = butter_bandpass(low, high, fs, order=order)
     Xf = np.zeros_like(X, dtype=np.float64)
-    for c in range(X.shape[1]):
-        col = X[:, c].astype(np.float64) - np.mean(X[:, c])
-        Xf[:, c] = filtfilt(b, a, col)
-    return Xf
+    if method == 'filtfilt':
+        b, a = butter_bandpass(low, high, fs, order=order)
+        for c in range(X.shape[1]):
+            col = X[:, c].astype(np.float64) - np.mean(X[:, c])
+            Xf[:, c] = filtfilt(b, a, col)
+        return Xf
+
+    if method == 'sosfilt':
+        nyq = 0.5 * fs
+        low_n = max(1e-6, low / nyq)
+        high_n = min(0.9999, high / nyq)
+        sos = butter(order, [low_n, high_n], btype='band', output='sos')
+        for c in range(X.shape[1]):
+            col = X[:, c].astype(np.float64) - np.mean(X[:, c])
+            Xf[:, c] = sosfilt(sos, col)
+        return Xf
+
+    raise ValueError(f"Unsupported DAS filter method: {method}")
 
 
 def robust_zscore(x, eps=1e-9):
@@ -365,11 +396,17 @@ class DASFeatureExtractor:
     
     def multi_band_filter(self, das):
         """多频带滤波"""
+        if self.config.disable_das_bandpass:
+            print("[DAS] Bandpass disabled, using raw DAS for all configured bands")
+            raw = das.astype(np.float64)
+            return {tuple(band): raw for band in self.config.das_bp_bands}
+
         bands_filtered = {}
         for low, high in self.config.das_bp_bands:
-            print(f"[DAS] Applying {low}-{high}Hz bandpass filter...")
+            print(f"[DAS] Applying {low}-{high}Hz bandpass filter ({self.config.das_filter_method})...")
             filtered = bandpass_filter_2d(das, self.config.das_fs, low, high, 
-                                          self.config.das_filter_order)
+                                          self.config.das_filter_order,
+                                          method=self.config.das_filter_method)
             bands_filtered[(low, high)] = filtered
         return bands_filtered
     
@@ -404,6 +441,7 @@ class DASFeatureExtractor:
         """在指定时间点提取多频带特征"""
         fs = self.config.das_fs
         half_win = int(window_s * fs / 2)
+        primary_band = tuple(self.config.das_bp_bands[0])
         
         features_list = []
         valid_times = []
@@ -411,7 +449,7 @@ class DASFeatureExtractor:
         for t in sample_times:
             t_idx = int(t * fs)
             start = max(0, t_idx - half_win)
-            end = min(das_bands[(5, 10)].shape[0], t_idx + half_win)
+            end = min(das_bands[primary_band].shape[0], t_idx + half_win)
             
             if end - start < half_win:
                 continue
@@ -855,6 +893,7 @@ class WeaklySupervisedDetector:
         self.scaler = StandardScaler()
         self.last_eval_report = None
         self.recommended_threshold = None
+        self.last_train_accuracy = None
 
     def _effective_model_type(self):
         has_cuda = TORCH_AVAILABLE and torch.cuda.is_available()
@@ -965,14 +1004,15 @@ class WeaklySupervisedDetector:
         print(f"[Eval] Suggestion: try --confidence_threshold {best['threshold']:.2f}")
 
     def prepare_training_data(self, das_bands, audio_step_times, 
-                              neg_ratio=4.0, time_range=None):
+                              neg_ratio=2.0, time_range=None):
         """
         准备训练数据
         - 正样本：音频检测到的脚步时间点附近
         - 负样本：远离任何脚步的时间点
         """
         if time_range is None:
-            T = das_bands[(5, 10)].shape[0]
+            primary_band = tuple(self.config.das_bp_bands[0])
+            T = das_bands[primary_band].shape[0]
             time_range = (0, T / self.config.das_fs)
         
         t_min, t_max = time_range
@@ -983,7 +1023,7 @@ class WeaklySupervisedDetector:
         
         # 生成负样本时间（包含 hard negatives + easy negatives）
         # 旧逻辑使用过大的排除半径，容易导致负样本过少。
-        exclude_radius = max(0.08, self.config.step_min_interval * 0.45)
+        exclude_radius = max(0.08, self.config.step_min_interval * 0.6)
         hard_upper = max(exclude_radius + 0.05, self.config.step_min_interval * 1.2)
         all_times = np.arange(t_min + 0.35, t_max - 0.35, 0.03)
 
@@ -1055,6 +1095,7 @@ class WeaklySupervisedDetector:
             train_acc = self.model.score(X_scaled, y)
 
         # 训练集准确率
+        self.last_train_accuracy = float(train_acc)
         print(f"[Train] Training accuracy: {train_acc:.4f}")
         
         return self.model
@@ -1065,7 +1106,8 @@ class WeaklySupervisedDetector:
             raise ValueError("Model not trained yet")
         
         if time_range is None:
-            T = das_bands[(5, 10)].shape[0]
+            primary_band = tuple(self.config.das_bp_bands[0])
+            T = das_bands[primary_band].shape[0]
             time_range = (0.5, T / self.config.das_fs - 0.5)
         
         t_min, t_max = time_range
@@ -1155,6 +1197,8 @@ class WeaklySupervisedDetector:
                 'das_fs': self.config.das_fs,
                 'das_bp_bands': self.config.das_bp_bands,
                 'das_filter_order': self.config.das_filter_order,
+                'das_filter_method': self.config.das_filter_method,
+                'disable_das_bandpass': self.config.disable_das_bandpass,
                 'step_min_interval': self.config.step_min_interval,
                 'feature_win_ms': self.config.feature_win_ms,
                 'feature_step_ms': self.config.feature_step_ms,
@@ -1374,6 +1418,28 @@ class Visualizer:
         plt.close()
         
         print(f"[Viz] Saved: {output_path}")
+
+    def plot_signal_heatmap(self, energy_matrix, frame_times, output_path, title):
+        """绘制纯信号能量热图（无脚步标记）"""
+        fig, ax = plt.subplots(1, 1, figsize=(16, 6))
+
+        log_energy = np.log10(energy_matrix + 1e-10)
+
+        im = ax.imshow(log_energy, aspect='auto', origin='lower',
+                       extent=[frame_times[0], frame_times[-1],
+                               0, energy_matrix.shape[0]],
+                       cmap='viridis', interpolation='bilinear')
+
+        ax.set_xlabel('Time (s)', fontsize=12)
+        ax.set_ylabel('Channel', fontsize=12)
+        ax.set_title(title, fontsize=14)
+
+        plt.colorbar(im, ax=ax, label='Log Energy', shrink=0.9)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"[Viz] Saved: {output_path}")
     
     def plot_detection_comparison(self, frame_times, audio_env, audio_step_times,
                                    das_prob_curve, das_step_times, output_path):
@@ -1415,6 +1481,34 @@ class Visualizer:
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
         
+        print(f"[Viz] Saved: {output_path}")
+
+    def plot_audio_envelope_window(self, frame_times, audio_env, audio_step_times,
+                                   output_path, window_s=50.0):
+        """输出单张音频包络图：使用全时间窗口。"""
+        frame_times = np.asarray(frame_times, dtype=np.float64)
+        audio_env = np.asarray(audio_env, dtype=np.float64)
+        audio_step_times = np.asarray(audio_step_times, dtype=np.float64)
+
+        if len(frame_times) < 2 or len(audio_env) < 2:
+            return
+
+        fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+        ax.plot(frame_times, audio_env, 'b-', linewidth=1.0)
+
+        for t_step in audio_step_times:
+            ax.axvline(t_step, color='cyan', alpha=0.7, linewidth=1)
+
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Audio Envelope')
+        ax.set_xlim(frame_times[0], frame_times[-1])
+        ax.set_title('Audio Envelope (Full Window)')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
         print(f"[Viz] Saved: {output_path}")
     
     def plot_detailed_segment(self, das_filtered, frame_times, step_events,
@@ -1583,10 +1677,11 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     
     # 多频带滤波
     das_bands = das_extractor.multi_band_filter(das_trimmed)
+    primary_band = tuple(config.das_bp_bands[0])
     
     # 计算主频带能量矩阵（用于可视化）
-    das_5_10 = das_bands[(5, 10)]
-    energy_matrix, frame_times = das_extractor.compute_short_time_energy(das_5_10)
+    das_primary = das_bands[primary_band]
+    energy_matrix, frame_times = das_extractor.compute_short_time_energy(das_primary)
     
     print(f"[DAS] Energy matrix shape: {energy_matrix.shape}")
     
@@ -1665,7 +1760,7 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     # ===== 4. 估计通道位置 =====
     step_events = []
     for t, prob in zip(step_times_detected, step_probs):
-        ch, ch_conf = das_extractor.estimate_channel_for_time(das_5_10, t)
+        ch, ch_conf = das_extractor.estimate_channel_for_time(das_primary, t)
         step_events.append((t, ch, prob * ch_conf))
     
     print(f"\n[Result] Detected {len(step_events)} footstep events")
@@ -1689,6 +1784,45 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     trajectory_path = os.path.join(config.output_dir, f"{base_name}_channel_trajectory.png")
     viz.plot_channel_trajectory(step_events, trajectory_path)
 
+    # 额外输出：未经过带通滤波的原始信号热图
+    raw_energy_matrix, raw_frame_times = das_extractor.compute_short_time_energy(das_trimmed)
+    raw_heatmap_path = os.path.join(config.output_dir, f"{base_name}_heatmap_raw.png")
+    viz.plot_signal_heatmap(
+        raw_energy_matrix,
+        raw_frame_times,
+        raw_heatmap_path,
+        title=f"DAS Signal Heatmap (Raw, No Bandpass): {base_name}",
+    )
+
+    # 额外输出：多频段带通后的信号热图（配色保持与主热图一致）
+    heatmap_bands = [
+        (2.5, 5),
+        (5, 10),
+        (10, 20),
+        (20, 50),
+        (50, 100),
+        (100, 1000),
+    ]
+    for low, high in heatmap_bands:
+        print(f"[Viz] Building band heatmap: {low}-{high}Hz")
+        das_bp = bandpass_filter_2d(
+            das_trimmed,
+            config.das_fs,
+            low,
+            high,
+            config.das_filter_order,
+            method=config.das_filter_method,
+        )
+        band_energy, band_frame_times = das_extractor.compute_short_time_energy(das_bp)
+        band_tag = f"{str(low).replace('.', 'p')}_{str(high).replace('.', 'p')}Hz"
+        band_heatmap_path = os.path.join(config.output_dir, f"{base_name}_heatmap_bp_{band_tag}.png")
+        viz.plot_signal_heatmap(
+            band_energy,
+            band_frame_times,
+            band_heatmap_path,
+            title=f"DAS Signal Heatmap ({low}-{high}Hz)",
+        )
+
     # 导出模型学习到的pattern（仅CNN模型）
     pattern_path = os.path.join(config.output_dir, f"{base_name}_learned_pattern.png")
     detector.export_learned_pattern(pattern_path)
@@ -1711,6 +1845,16 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
                                       audio_step_times,
                                       das_prob_resampled, step_times_detected,
                                       compare_path)
+
+        # 单图输出：音频包络稳定窗口（约30秒）
+        audio_window_path = os.path.join(config.output_dir, f"{base_name}_audio_envelope_window.png")
+        viz.plot_audio_envelope_window(
+            frame_times,
+            audio_env_resampled,
+            audio_step_times,
+            audio_window_path,
+            window_s=50.0,
+        )
     
     # ===== 6. 输出CSV结果 =====
     csv_output_path = os.path.join(config.output_dir, f"{base_name}_steps.csv")
@@ -1718,6 +1862,115 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     df_out = df_out.sort_values('time').reset_index(drop=True)
     df_out.to_csv(csv_output_path, index=False)
     print(f"[Output] Steps CSV: {csv_output_path}")
+
+    # ===== 7. 输出指标文本 =====
+    eval_report = detector.last_eval_report or {}
+    train_acc = detector.last_train_accuracy
+
+    energy_curve = np.mean(energy_matrix, axis=0)
+    step_times_for_mask = np.array([e[0] for e in step_events], dtype=np.float64)
+    event_window_s = max(0.08, config.feature_win_ms * 1e-3)
+
+    event_mask = np.zeros_like(frame_times, dtype=bool)
+    for t in step_times_for_mask:
+        event_mask |= np.abs(frame_times - t) <= event_window_s
+
+    event_energy_mean = float(np.mean(energy_curve[event_mask])) if np.any(event_mask) else np.nan
+    bg_mask = ~event_mask
+    bg_energy_mean = float(np.mean(energy_curve[bg_mask])) if np.any(bg_mask) else np.nan
+
+    if np.isfinite(event_energy_mean) and np.isfinite(bg_energy_mean) and bg_energy_mean > 0:
+        event_bg_ratio = event_energy_mean / bg_energy_mean
+        snr_db = 10.0 * np.log10(event_bg_ratio + 1e-12)
+    else:
+        event_bg_ratio = np.nan
+        snr_db = np.nan
+
+    def _fmt(v, digits=4):
+        if v is None:
+            return "N/A"
+        try:
+            fv = float(v)
+            if not np.isfinite(fv):
+                return "N/A"
+            return f"{fv:.{digits}f}"
+        except Exception:
+            return "N/A"
+
+    # ===== 7.1 路径级指标 (CR / DC / PJ) =====
+    t_gap = float(getattr(config, 'path_gap_s', 1.2))
+    delta_c_max = float(getattr(config, 'path_delta_c_max', 8))
+    eps_d = float(getattr(config, 'path_eps_d', 1))
+
+    sorted_events = sorted(step_events, key=lambda x: x[0])
+    trajectories = []
+    if len(sorted_events) > 0:
+        cur = [sorted_events[0]]
+        for ev in sorted_events[1:]:
+            if (ev[0] - cur[-1][0]) > t_gap:
+                trajectories.append(cur)
+                cur = [ev]
+            else:
+                cur.append(ev)
+        trajectories.append(cur)
+
+    traj_valid = [traj for traj in trajectories if len(traj) >= 3]
+    K = len(traj_valid)
+
+    cr_num = 0.0
+    cr_den = 0.0
+    dc_vals = []
+    pj_vals = []
+
+    for traj in traj_valid:
+        ch = np.array([p[1] for p in traj], dtype=np.float64)
+        d = np.diff(ch)
+        if len(d) == 0:
+            continue
+
+        # CR_k
+        deltas = np.abs(d)
+        cr_hits = float(np.sum(deltas <= delta_c_max))
+        cr_num += cr_hits
+        cr_den += float(len(d))
+
+        # DC_k
+        n_pos = int(np.sum(d > eps_d))
+        n_neg = int(np.sum(d < -eps_d))
+        denom = n_pos + n_neg
+        if denom > 0:
+            dc_vals.append(max(n_pos, n_neg) / float(denom))
+
+        # PJ_k
+        pj_vals.append(float(np.std(d)))
+
+    CR = (cr_num / cr_den) if cr_den > 0 else np.nan
+    DC = float(np.mean(dc_vals)) if len(dc_vals) > 0 else np.nan
+    PJ = float(np.mean(pj_vals)) if len(pj_vals) > 0 else np.nan
+
+    metrics_txt_path = os.path.join(config.output_dir, f"{base_name}_metrics.txt")
+    lines = [
+        f"PR-AUC: {_fmt(eval_report.get('pr_auc'))}",
+        f"Precision: {_fmt(eval_report.get('best_precision'))}",
+        f"Recall: {_fmt(eval_report.get('best_recall'))}",
+        f"F1: {_fmt(eval_report.get('best_f1'))}",
+        f"Best_threshold: {_fmt(eval_report.get('best_threshold'))}",
+        f"Training_accuracy: {_fmt(train_acc)}",
+        f"SNR(dB): {_fmt(snr_db)}",
+        f"事件/背景能量比: {_fmt(event_bg_ratio)}",
+        "",
+        f"T_gap(s): {_fmt(t_gap, 3)}",
+        f"Delta_c_max(ch): {_fmt(delta_c_max, 3)}",
+        f"Epsilon_d(ch): {_fmt(eps_d, 3)}",
+        f"轨迹数量K: {K}",
+        f"CR: {_fmt(CR)}",
+        f"DC: {_fmt(DC)}",
+        f"PJ: {_fmt(PJ)}",
+        f"Path-MAE(ch): N/A",
+    ]
+    with open(metrics_txt_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[Output] Metrics TXT: {metrics_txt_path}")
     
     # 统计信息
     print("\n" + "=" * 60)
@@ -1770,6 +2023,11 @@ Examples:
                         help='DAS采样率 (Hz)，默认2000')
     parser.add_argument('--audio_sr', type=int, default=48000,
                         help='音频重采样率 (Hz)，默认48000')
+    parser.add_argument('--das_filter_method', type=str, default='filtfilt',
+                        choices=['filtfilt', 'sosfilt'],
+                        help='DAS带通滤波方法：filtfilt(默认, 零相位) 或 sosfilt(因果)')
+    parser.add_argument('--disable_das_bandpass', action='store_true',
+                        help='关闭DAS带通滤波，直接使用原始DAS信号训练/推理')
     
     # 时间对齐
     parser.add_argument('--align_dt', type=float, default=0.0,
@@ -1845,6 +2103,8 @@ def main():
         config.cnn_window_s = args.cnn_window_s
     if args.cnn_predict_chunk is not None:
         config.cnn_predict_chunk = args.cnn_predict_chunk
+    if args.disable_das_bandpass:
+        config.disable_das_bandpass = True
     
     # ===== 仅推理模式 =====
     if args.inference_only:
@@ -1912,10 +2172,11 @@ def run_inference_only(das_csv, model_path, config):
     
     # 多频段带通滤波
     das_bands = das_extractor.multi_band_filter(das_raw)
-    das_5_10 = das_bands[(5, 10)]
+    primary_band = tuple(config.das_bp_bands[0])
+    das_primary = das_bands[primary_band]
     
     # 能量矩阵
-    energy_matrix, frame_times = das_extractor.compute_short_time_energy(das_5_10)
+    energy_matrix, frame_times = das_extractor.compute_short_time_energy(das_primary)
     
     # ===== 3. 特征提取和预测 =====
     # 使用 detector.predict_on_grid 进行网格预测
@@ -1933,7 +2194,7 @@ def run_inference_only(das_csv, model_path, config):
     # ===== 4. 估计通道位置 =====
     step_events = []
     for t, prob in zip(step_times_detected, step_probs):
-        ch, ch_conf = das_extractor.estimate_channel_for_time(das_5_10, t)
+        ch, ch_conf = das_extractor.estimate_channel_for_time(das_primary, t)
         step_events.append((t, ch, prob * ch_conf))
     
     # ===== 5. 可视化输出 =====

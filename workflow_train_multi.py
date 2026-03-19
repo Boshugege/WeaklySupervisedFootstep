@@ -121,6 +121,9 @@ def parse_args():
                         help="深度模型batch大小，默认 64")
     parser.add_argument("--torch_lr", type=float, default=1e-3,
                         help="深度模型学习率，默认 1e-3")
+    parser.add_argument("--das_filter_method", type=str, default="sosfilt",
+                        choices=["filtfilt", "sosfilt"],
+                        help="DAS带通滤波方法，默认 sosfilt")
     
     # 输出控制
     parser.add_argument("--model_name", type=str, default=None,
@@ -477,6 +480,7 @@ def main():
         "--torch_epochs", str(args.torch_epochs),
         "--torch_batch_size", str(args.torch_batch_size),
         "--torch_lr", str(args.torch_lr),
+        "--das_filter_method", str(args.das_filter_method),
         "--self_train_rounds", str(args.self_train_rounds),
         "--confidence_threshold", str(args.confidence_threshold),
         "--output_dir", str(results_output_dir),
