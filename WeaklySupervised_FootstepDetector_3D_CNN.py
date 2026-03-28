@@ -14,13 +14,13 @@
 
 示例：
   # 自动提取 + 训练 + 推理
-  python WeaklySupervised_FootstepDetector_2D_CNN.py --name wangdihai
+  python WeaklySupervised_FootstepDetector_3D_CNN.py --name wangdihai
 
   # 直接CSV + 音频训练
-  python WeaklySupervised_FootstepDetector_2D_CNN.py --das_csv output/wangdihai/signals/wangdihai.csv --audio Data/Audio/wangdihai.mp3
+  python WeaklySupervised_FootstepDetector_3D_CNN.py --das_csv output/wangdihai/signals/wangdihai.csv --audio Data/Audio/wangdihai.mp3
 
   # 仅推理
-  python WeaklySupervised_FootstepDetector_2D_CNN.py --das_csv output/wangdihai/signals/wangdihai.csv --load_model output/3d_cnn/wangdihai_3dcnn.pt --inference_only
+  python WeaklySupervised_FootstepDetector_3D_CNN.py --das_csv output/wangdihai/signals/wangdihai.csv --load_model output/3d_cnn/wangdihai_3dcnn.pt --inference_only
 """
 
 from __future__ import annotations
@@ -92,6 +92,18 @@ class Config:
     score_threshold: float = 0.40
     peak_time_dist_s: float = 0.20
     peak_channel_dist: int = 2
+    use_adaptive_threshold: bool = True
+    adaptive_threshold_quantile: float = 99.2
+    topk_per_time: int = 2
+    max_events: int = 600
+
+    track_time_gap_s: float = 0.35
+    track_channel_gap: int = 8
+    min_track_len: int = 3
+    strong_confidence_quantile: float = 99.8
+
+    aux_center_loss_weight: float = 0.20
+    aux_center_halfwidth: int = 1
 
 
 def robust_zscore(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
@@ -437,27 +449,55 @@ def train_model(x: np.ndarray, y: np.ndarray, cfg: Config, device: torch.device)
 
     pos_weight = float((len(y) - np.sum(y)) / (np.sum(y) + 1e-6))
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device, dtype=torch.float32))
+    map_criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     model.train()
     for epoch in range(1, cfg.epochs + 1):
         total_loss = 0.0
+        total_cls_loss = 0.0
+        total_map_loss = 0.0
         total = 0
         for bx, by in loader:
             bx = bx.to(device)
             by = by.to(device)
 
-            logits, _ = model(bx)
-            loss = criterion(logits, by)
+            logits, map2d = model(bx)
+            cls_loss = criterion(logits, by)
+
+            target_map = torch.zeros_like(map2d)
+            pos_mask = by > 0.5
+            if torch.any(pos_mask):
+                energy_hint = torch.mean(bx[:, 0], dim=1)  # [N,T,C], 沿频带均值
+                center_t = int(energy_hint.shape[1] // 2)
+                hint = energy_hint[pos_mask, center_t, :]
+                hint_min = torch.amin(hint, dim=1, keepdim=True)
+                hint_max = torch.amax(hint, dim=1, keepdim=True)
+                hint_norm = (hint - hint_min) / (hint_max - hint_min + 1e-6)
+
+                half_width = max(0, int(cfg.aux_center_halfwidth))
+                t0 = max(0, center_t - half_width)
+                t1 = min(target_map.shape[1], center_t + half_width + 1)
+                for t_index in range(t0, t1):
+                    target_map[pos_mask, t_index, :] = hint_norm
+
+            map_loss = map_criterion(map2d, target_map)
+            loss = cls_loss + float(cfg.aux_center_loss_weight) * map_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += float(loss.item()) * bx.shape[0]
+            total_cls_loss += float(cls_loss.item()) * bx.shape[0]
+            total_map_loss += float(map_loss.item()) * bx.shape[0]
             total += bx.shape[0]
 
-        print(f"[Train] epoch {epoch:02d}/{cfg.epochs} loss={total_loss / max(total, 1):.4f}")
+        print(
+            f"[Train] epoch {epoch:02d}/{cfg.epochs} "
+            f"loss={total_loss / max(total, 1):.4f} "
+            f"(cls={total_cls_loss / max(total, 1):.4f}, map={total_map_loss / max(total, 1):.4f})"
+        )
 
     return model
 
@@ -525,28 +565,84 @@ def detect_2d_peaks(
     t_radius = max(1, int((cfg.peak_time_dist_s / max(dt, 1e-6)) / 2))
     c_radius = max(1, int(cfg.peak_channel_dist))
 
+    if bool(cfg.use_adaptive_threshold):
+        threshold = float(np.percentile(score_map, float(cfg.adaptive_threshold_quantile)))
+    else:
+        threshold = float(cfg.score_threshold)
+    threshold = max(1e-6, threshold)
+
     local_max = score_map == maximum_filter(score_map, size=(2 * c_radius + 1, 2 * t_radius + 1), mode="nearest")
-    mask = local_max & (score_map >= cfg.score_threshold)
+    mask = local_max & (score_map >= threshold)
 
     coords = np.argwhere(mask)  # [N,2], each row [c,t]
     if len(coords) == 0:
+        print(f"[Detect] threshold={threshold:.4f}, no candidates")
         return []
 
     scores = score_map[coords[:, 0], coords[:, 1]]
     order = np.argsort(scores)[::-1]
 
-    selected: List[Tuple[int, int, float]] = []
+    # 每个时间帧保留top-k，避免单帧过多离散通道噪声
+    topk_per_time = max(1, int(cfg.topk_per_time))
+    time_bucket_counts: dict[int, int] = {}
+    filtered_candidates: List[Tuple[int, int, float]] = []
     for idx in order:
         c, t = int(coords[idx, 0]), int(coords[idx, 1])
         s = float(scores[idx])
+        used = time_bucket_counts.get(t, 0)
+        if used >= topk_per_time:
+            continue
+        time_bucket_counts[t] = used + 1
+        filtered_candidates.append((c, t, s))
 
-        keep = True
-        for pc, pt, _ in selected:
-            if abs(c - pc) <= c_radius and abs(t - pt) <= t_radius:
-                keep = False
-                break
-        if keep:
-            selected.append((c, t, s))
+    if not filtered_candidates:
+        print(f"[Detect] threshold={threshold:.4f}, no filtered candidates")
+        return []
+
+    # 轨迹连续性过滤：优先保留能组成连续路径的点，降低离群点影响
+    time_gap_frames = max(1, int(float(cfg.track_time_gap_s) / max(dt, 1e-6)))
+    channel_gap = max(1, int(cfg.track_channel_gap))
+    min_track_len = max(1, int(cfg.min_track_len))
+
+    filtered_candidates.sort(key=lambda x: x[1])
+    tracks: List[List[Tuple[int, int, float]]] = []
+
+    for c, t, s in filtered_candidates:
+        best_track_index = -1
+        best_cost = float("inf")
+        for track_index, track in enumerate(tracks):
+            last_c, last_t, _ = track[-1]
+            dt_frames = t - last_t
+            dc = abs(c - last_c)
+            if dt_frames < 0 or dt_frames > time_gap_frames or dc > channel_gap:
+                continue
+            cost = dt_frames + 0.5 * dc
+            if cost < best_cost:
+                best_cost = cost
+                best_track_index = track_index
+        if best_track_index >= 0:
+            tracks[best_track_index].append((c, t, s))
+        else:
+            tracks.append([(c, t, s)])
+
+    selected: List[Tuple[int, int, float]] = []
+    all_scores = np.array([x[2] for x in filtered_candidates], dtype=np.float64)
+    strong_threshold = float(np.percentile(all_scores, float(cfg.strong_confidence_quantile)))
+
+    for track in tracks:
+        if len(track) >= min_track_len:
+            selected.extend(track)
+        else:
+            for item in track:
+                if item[2] >= strong_threshold:
+                    selected.append(item)
+
+    if not selected:
+        selected = filtered_candidates
+
+    selected.sort(key=lambda x: x[2], reverse=True)
+    max_events = max(1, int(cfg.max_events))
+    selected = selected[:max_events]
 
     events = []
     for c, t, s in selected:
@@ -555,6 +651,10 @@ def detect_2d_peaks(
         events.append((sec, ch, s))
 
     events.sort(key=lambda x: x[0])
+    print(
+        f"[Detect] threshold={threshold:.4f}, raw={len(coords)}, topk={len(filtered_candidates)}, "
+        f"tracks={len(tracks)}, final={len(events)}"
+    )
     return events
 
 
@@ -633,6 +733,18 @@ def parse_args():
     p.add_argument("--score_threshold", type=float, default=0.40)
     p.add_argument("--peak_time_dist_s", type=float, default=0.20)
     p.add_argument("--peak_channel_dist", type=int, default=2)
+    p.add_argument("--disable_adaptive_threshold", action="store_true", help="关闭分位数自适应阈值，改用固定score_threshold")
+    p.add_argument("--adaptive_threshold_quantile", type=float, default=99.2, help="自适应阈值分位数(0-100)")
+    p.add_argument("--topk_per_time", type=int, default=2, help="每个时间帧最多保留的通道峰值数")
+    p.add_argument("--max_events", type=int, default=600, help="最终最多输出事件数")
+
+    p.add_argument("--track_time_gap_s", type=float, default=0.35, help="轨迹连接最大时间间隔(秒)")
+    p.add_argument("--track_channel_gap", type=int, default=8, help="轨迹连接最大通道差")
+    p.add_argument("--min_track_len", type=int, default=3, help="保留轨迹最短长度")
+    p.add_argument("--strong_confidence_quantile", type=float, default=99.8, help="短轨迹保留的高置信分位数")
+
+    p.add_argument("--aux_center_loss_weight", type=float, default=0.20, help="中心时刻辅助定位损失权重")
+    p.add_argument("--aux_center_halfwidth", type=int, default=1, help="中心监督半宽(帧)")
 
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
 
@@ -709,6 +821,16 @@ def main():
         score_threshold=float(args.score_threshold),
         peak_time_dist_s=float(args.peak_time_dist_s),
         peak_channel_dist=int(args.peak_channel_dist),
+        use_adaptive_threshold=not bool(args.disable_adaptive_threshold),
+        adaptive_threshold_quantile=float(args.adaptive_threshold_quantile),
+        topk_per_time=int(args.topk_per_time),
+        max_events=int(args.max_events),
+        track_time_gap_s=float(args.track_time_gap_s),
+        track_channel_gap=int(args.track_channel_gap),
+        min_track_len=int(args.min_track_len),
+        strong_confidence_quantile=float(args.strong_confidence_quantile),
+        aux_center_loss_weight=float(args.aux_center_loss_weight),
+        aux_center_halfwidth=int(args.aux_center_halfwidth),
     )
 
     device = pick_device(args.device)
