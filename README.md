@@ -1,781 +1,805 @@
-# 弱监督DAS脚步检测系统
+# 弱监督 DAS 脚步检测项目使用说明
 
-```bash
-# 单人训练（默认：头部裁掉50s，尾部裁掉20s，跳过前18个通道）
-python workflow_train.py wangdihai
+本项目用于在分布式光纤声学传感（DAS）数据中检测脚步事件，并估计脚步发生的通道位置。当前仓库包含三条主线：
 
-# 自定义裁剪
-python workflow_train.py wangdihai --trim_head 60 --trim_tail 30
+1. 离线训练：从 `name` 出发，按 Airtag 时间从 TDMS 中切出 DAS CSV，再结合音频弱标签训练模型。
+2. 离线推理：使用已有模型对新数据进行推理，可选带音频对比，也可将离线结果按在线 JSON 协议回放。
+3. 在线推理与可视化：按 TDMS 分块模拟在线推理，并将 `signal/event` JSON 包发送给 `JSONStreamPlot.py` 实时显示。
 
-# 多人联合训练（提高泛化性）
-# 打分
-python batch_audio_spectrogram.py
-# 按打分排 top 12
-python.exe workflow_train_multi.py --top_n 12 --label_source wangdihai
+这份 README 只描述当前仓库里仍然有效、仍然推荐使用的脚本和目录，不再以历史版本为准。
 
-# 推理
-python workflow_infer.py wangjiahui --model output/wangdihai/models/wangdihai_model.joblib
-python workflow_infer.py wuwenxuan --model output/multi_wangdihai_wangjiahui/models/multi_wangdihai_wangjiahui.joblib
+## 1. 当前建议使用的入口
+
+| 脚本 | 作用 | 是否推荐作为主入口 |
+| --- | --- | --- |
+| `workflow_train.py` | 离线训练完整流程 | 是 |
+| `workflow_infer.py` | 离线推理完整流程 | 是 |
+| `WeaklySupervised_FootstepDetector.py` | 核心训练/推理脚本 | 是，适合高级用法 |
+| `extract_name_signals_from_tdms.py` | 从 TDMS 按名字切出 DAS CSV | 是 |
+| `realtime_infer_stream.py` | 在线推理模拟并发送 JSON 流 | 是 |
+| `JSONStreamPlot.py` | 接收在线 JSON 流并实时可视化 | 是 |
+| `experiment/WeaklySupervised_FootstepDetector_3D_CNN.py` | 3D-CNN 实验方向 | 实验性质 |
+
+`deprecated/` 中的内容目前已废弃。
+
+- 
+
+## 2. 目录与数据约定
+
+当前仓库目录中，和实际运行最相关的是以下部分：
+
+```text
+WeaklySupervisedFootstep/
+├── Data/
+│   ├── Airtag/
+│   ├── Audio/
+│   ├── Video/
+│   └── DAS/
+├── output/
+├── examples/
+├── experiment/
+├── deprecated/
+├── workflow_train.py
+├── workflow_infer.py
+├── WeaklySupervised_FootstepDetector.py
+├── extract_name_signals_from_tdms.py
+├── realtime_infer_stream.py
+├── JSONStreamPlot.py
+└── requirements.txt
 ```
 
-```
-期望目录结构
+### 2.1 数据目录含义
+
+```text
 Data/
-├── Video/          # 视频文件（MP4）
-│   ├── wangdihai.MP4
-│   ├── wangjiahui.MP4
-│   └── wuwenxuan.MP4
-├── Airtag/         # Airtag时间标记CSV
-│   ├── wangdihai.csv
-│   ├── wangjiahui.csv
-│   └── ...
-└── DAS/            # TDMS原始数据
+├── Audio/
+│   └── <name>.mp3
+├── Video/
+│   └── <name>.MP4 / <name>.mp4 / <name>.MOV / <name>.mov
+├── Airtag/
+│   └── <name>.csv
+└── DAS/
     └── *.tdms
 ```
 
-## 项目概述
+约定如下：
 
-本项目实现了一个基于**弱监督学习**的分布式光纤声学传感(DAS)脚步事件检测系统。系统利用音频信号作为弱监督源，在没有精确标注的情况下，从DAS数据中自动检测脚步事件并定位其通道位置。
+- `name` 是整个流程的主索引键。
+- 训练工作流默认要求 `Data/Audio/<name>.mp3` 存在。
+- 纯推理不要求 `Data/Video/<name>.*`。
+- 只有在推理时显式使用 `--with_audio` 做对比时，才会尝试读取 `Data/Video/<name>.*`。
+- `Data/Airtag/<name>.csv` 用于提供该人的起止时间窗口。
+- `Data/DAS/*.tdms` 是原始 DAS 文件，脚本会根据 Airtag 时间自动找重叠段并切片。
 
-### 核心特性
+### 2.2 Airtag CSV 基本要求
 
-- ✅ **弱监督学习**：无需人工标注，利用音频自动生成弱标签
-- ✅ **自训练迭代**：通过多轮自训练逐步提高检测召回率
-- ✅ **多频带分析**：支持多个频带特征提取
-- ✅ **智能时间裁剪**：自动根据数据长度计算裁剪范围（头部/尾部）
-- ✅ **通道屏蔽**：可跳过噪声通道（默认跳过前18个）
-- ✅ **多人联合训练**：支持多人数据联合训练提高泛化性
-- ✅ **丰富可视化**：热图、轨迹图、对比图等多种输出
-- ✅ **调优工具**：独立的音频检测验证工具
+`extract_name_signals_from_tdms.py` 要求 Airtag CSV 第一列是时间列，并且表头以 `datetime` 开头。脚本支持多种常见时间格式，包括：
 
----
+- `YYYY-mm-dd HH:MM:SS`
+- `YYYY/mm/dd HH:MM:SS`
+- 带毫秒版本
 
-## 文件结构
+默认按 `UTC+8` 解释 CSV 时间，即 `--csv-utc-offset-hours 8.0`。
 
-```
-WeaklySupervisedFootstep/
-├── WeaklySupervised_FootstepDetector.py   # 主检测程序
-├── workflow_train.py                      # 单人训练工作流
-├── workflow_train_multi.py                # 多人联合训练工作流
-├── workflow_infer.py                      # 推理工作流
-├── extract_name_signals_from_tdms.py      # TDMS信号提取（支持通道屏蔽）
-├── audio_step_tuning.py                   # 音频检测调优工具
-├── README.md                              # 本文档
-├── Data/                                  # 数据目录
-│   ├── Video/                             # 视频文件
-│   ├── Airtag/                            # Airtag CSV
-│   └── DAS/                               # TDMS原始数据
-└── output/                                # 输出目录
+### 2.3 DAS CSV 输出格式
+
+切片完成后的 DAS CSV 形如：
+
+```csv
+ch_18,ch_19,ch_20,...
+182,173,182,...
+120,120,134,...
+...
 ```
 
----
+说明：
 
-## 脚本说明
+- 每列对应一个通道。
+- 每行对应一个时间采样点。
+- 默认采样率是 `2000 Hz`。
+- 默认会跳过前 `18` 个通道，因此列名通常从 `ch_18` 开始。
 
-### 1. WeaklySupervised_FootstepDetector.py
+## 3. 环境准备
 
-**主检测程序** - 完整的弱监督脚步检测流程
+### 3.1 安装依赖
 
-#### 功能
+建议在虚拟环境中安装：
 
-- 加载DAS CSV数据和音频/视频文件
-- 多频带滤波处理
-- 音频弱标签提取
-- 弱监督模型训练
-- 自训练迭代优化
-- 通道位置估计
-- 可视化输出
-
-#### 命令行参数
-
-| 参数                     | 类型  | 默认值                   | 说明                   |
-| ------------------------ | ----- | ------------------------ | ---------------------- |
-| `--das_csv`, `-d`        | str   | 必需                     | DAS CSV文件路径        |
-| `--audio`, `-a`          | str   | None                     | 音频/视频文件路径      |
-| `--trim_start`           | float | None                     | 数据起始裁剪时间（秒） |
-| `--trim_end`             | float | None                     | 数据结束裁剪时间（秒） |
-| `--das_fs`               | int   | 2000                     | DAS采样率 (Hz)         |
-| `--audio_sr`             | int   | 48000                    | 音频重采样率 (Hz)      |
-| `--align_dt`             | float | 0.0                      | 时间对齐偏移量         |
-| `--self_train_rounds`    | int   | 3                        | 自训练迭代轮数         |
-| `--confidence_threshold` | float | 0.7                      | 高置信预测阈值         |
-| `--output_dir`, `-o`     | str   | output/weakly_supervised | 输出目录               |
-
-#### 使用示例
-
-```bash
-python WeaklySupervised_FootstepDetector.py \
-    --das_csv "path/to/data.csv" \
-    --audio "path/to/video.mp4" \
-    --trim_start 50 \
-    --trim_end 200 \
-    --output_dir "output/results"
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
----
+`requirements.txt` 当前包含：
 
-### 2. workflow_train.py
+- `numpy`
+- `pandas`
+- `scipy`
+- `matplotlib`
+- `librosa`
+- `scikit-learn`
+- `torch`
+- `joblib`
+- `soundfile`
+- `nptdms`
 
-**训练工作流** - 单人训练的完整流程
+如果你不使用虚拟环境，至少要保证运行这些脚本的 Python 解释器已经安装上述依赖。
 
-#### 功能
+### 3.2 Windows 终端编码问题
 
-- 自动提取TDMS信号（支持通道屏蔽）
-- 自动计算时间裁剪范围（根据数据长度）
-- 训练弱监督模型并保存
+部分脚本打印了 Unicode 符号。在某些 Windows 终端中，如果默认编码不是 UTF-8，可能出现输出报错。可以先执行：
 
-#### 命令行参数
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+```
 
-| 参数                     | 类型  | 默认值 | 说明                               |
-| ------------------------ | ----- | ------ | ---------------------------------- |
-| `name`                   | str   | 必需   | 目标名字（对应Video/Airtag文件名） |
-| `--trim_head`            | float | 50.0   | 从数据开头裁掉的时长（秒）         |
-| `--trim_tail`            | float | 20.0   | 从数据结尾裁掉的时长（秒）         |
-| `--skip_channels`        | int   | 18     | 跳过前N个通道（设为0保留所有）     |
-| `--das_fs`               | int   | 2000   | DAS采样率 (Hz)                     |
-| `--self_train_rounds`    | int   | 3      | 自训练迭代轮数                     |
-| `--confidence_threshold` | float | 0.7    | 高置信预测阈值                     |
-| `--overwrite`            | flag  | -      | 覆盖已存在的输出文件               |
+## 4. 最常用的标准流程
 
-#### 使用示例
+### 4.1 离线训练
 
-```bash
-# 使用默认参数（头部-50s，尾部-20s，跳过前18通道）
+最常用命令：
+
+```powershell
 python workflow_train.py wangdihai
-
-# 自定义裁剪
-python workflow_train.py wangdihai --trim_head 60 --trim_tail 30
-
-# 保留所有通道
-python workflow_train.py wangdihai --skip_channels 0
 ```
 
----
+这条命令会做以下事情：
 
-### 3. workflow_train_multi.py
+1. 检查 `Data/Audio/wangdihai.mp3`
+2. 检查 `Data/Airtag/wangdihai.csv`
+3. 检查 `Data/DAS/`
+4. 调用 `extract_name_signals_from_tdms.py` 从 TDMS 中切出 `output/wangdihai/signals/wangdihai.csv`
+5. 计算实际裁剪范围
+6. 调用 `WeaklySupervised_FootstepDetector.py` 训练模型
+7. 保存模型到 `output/wangdihai/models/wangdihai_model.joblib`
+8. 输出检测结果和图到 `output/wangdihai/results/`
 
-**多人联合训练工作流** - 提高模型泛化性
+### 4.2 离线推理
 
-#### 功能
+最常用命令：
 
-- 合并多人数据进行联合训练
-- 支持按名字读取裁剪表（根目录 `trim_profile.csv`）
-- 输出通用模型供推理使用
-
-#### 命令行参数
-
-| 参数                  | 类型  | 默认值          | 说明                       |
-| --------------------- | ----- | --------------- | -------------------------- |
-| `names`               | str[] | 必需（至少2个） | 训练数据的名字列表         |
-| `--trim_head`         | float | None            | 全局头部裁剪；未指定时按裁剪表 |
-| `--trim_tail`         | float | None            | 全局尾部裁剪；未指定时按裁剪表 |
-| `--trim_profile`      | str   | trim_profile.csv| 按名字配置裁剪参数的CSV     |
-| `--skip_channels`     | int   | 18              | 跳过前N个通道              |
-| `--model_name`        | str   | auto            | 输出模型名称               |
-| `--self_train_rounds` | int   | 3               | 自训练迭代轮数             |
-
-#### 使用示例
-
-```bash
-# 两人联合训练
-python workflow_train_multi.py wangdihai wangjiahui
-
-# 按 trim_profile.csv 裁剪（默认：每人 head=20s, tail=10s）
-python workflow_train_multi.py wangdihai wangjiahui
-
-# 三人联合训练，自定义模型名
-python workflow_train_multi.py wangdihai wangjiahui wuwenxuan --model_name multi_3person
-
-# 全局自定义裁剪（覆盖表单）
-python workflow_train_multi.py wangdihai wangjiahui --trim_head 60 --trim_tail 30
-```
-
----
-
-### 4. workflow_infer.py
-
-**推理工作流** - 使用已训练模型检测脚步
-
-#### 功能
-
-- 加载预训练模型
-- 自动提取信号并检测脚步
-- 支持无视频纯推理模式
-
-#### 命令行参数
-
-| 参数              | 类型  | 默认值 | 说明                       |
-| ----------------- | ----- | ------ | -------------------------- |
-| `name`            | str   | 必需   | 目标名字                   |
-| `--model`, `-m`   | str   | 必需   | 模型文件路径（.joblib）    |
-| `--trim_head`     | float | 50.0   | 从数据开头裁掉的时长（秒） |
-| `--trim_tail`     | float | 20.0   | 从数据结尾裁掉的时长（秒） |
-| `--skip_channels` | int   | 18     | 跳过前N个通道              |
-| `--with_audio`    | flag  | -      | 同时使用音频进行对比验证   |
-
-#### 使用示例
-
-```bash
-# 基本推理
+```powershell
 python workflow_infer.py wangjiahui --model output/wangdihai/models/wangdihai_model.joblib
-
-# 使用联合模型
-python workflow_infer.py wuwenxuan --model output/multi_wangdihai_wangjiahui/models/multi_wangdihai_wangjiahui.joblib
-
-# 带音频对比
-python workflow_infer.py wangjiahui --model model.joblib --with_audio
 ```
 
----
+这条命令会：
 
-### 5. extract_name_signals_from_tdms.py
+1. 检查或生成 `output/wangjiahui/signals/wangjiahui.csv`
+2. 加载 `.joblib` 模型
+3. 调用 `WeaklySupervised_FootstepDetector.py` 进行推理
+4. 将结果写到 `output/wangjiahui/results/`
 
-**信号提取脚本** - 从TDMS提取DAS信号
+### 4.3 在线推理模拟 + 实时显示
 
-#### 功能
+先开接收端：
 
-- 根据Airtag时间标记提取TDMS信号
-- 支持跳过前N个通道（通道屏蔽）
-- 输出CSV格式
-
-#### 命令行参数
-
-| 参数                | 类型  | 默认值 | 说明                           |
-| ------------------- | ----- | ------ | ------------------------------ |
-| `--skip-channels`   | int   | 18     | 跳过前N个通道（设为0保留所有） |
-| `--fs`              | float | 2000   | DAS采样率 (Hz)                 |
-| `--use-airtag-only` | flag  | -      | 仅使用Airtag（无需Video）      |
-
----
-
-### 6. audio_step_tuning.py
-
-**音频检测调优工具** - 验证和调整音频脚步检测参数
-
-#### 功能
-
-- 独立验证音频脚步检测的可信度
-- 可视化音频波形和检测结果
-- 输出调优建议
-- 与DAS数据叠加对比
-
-#### 命令行参数
-
-| 参数                 | 类型  | 默认值              | 说明                              |
-| -------------------- | ----- | ------------------- | --------------------------------- |
-| `--audio`, `-a`      | str   | 必需                | 音频/视频文件路径                 |
-| `--das_csv`, `-d`    | str   | None                | DAS CSV文件路径（可选，用于叠加） |
-| `--output_dir`, `-o` | str   | output/audio_tuning | 输出目录                          |
-| `--trim_start`       | float | 50.0                | 开始时间（秒）                    |
-| `--trim_end`         | float | 200.0               | 结束时间（秒）                    |
-| `--bp_low`           | float | 4000                | 带通低频 (Hz)                     |
-| `--bp_high`          | float | 10000               | 带通高频 (Hz)                     |
-| `--min_interval`     | float | 0.30                | 最小脚步间隔 (s)                  |
-| `--peak_prom`        | float | 1.5                 | 峰值显著性阈值                    |
-| `--peak_height`      | float | 0.8                 | 峰值高度阈值                      |
-
-#### 使用示例
-
-```bash
-# 基本使用
-python audio_step_tuning.py \
-    --audio "path/to/video.mp4" \
-    --trim_start 50 \
-    --trim_end 200
-
-# 调整检测参数
-python audio_step_tuning.py \
-    --audio "path/to/video.mp4" \
-    --peak_height 0.5 \
-    --peak_prom 1.0
-
-# 与DAS叠加对比
-python audio_step_tuning.py \
-    --audio "path/to/video.mp4" \
-    --das_csv "path/to/data.csv" \
-    --trim_start 50 \
-    --trim_end 200
+```powershell
+python JSONStreamPlot.py --protocol udp --port 9000
 ```
 
----
+再开在线发送端：
 
-## 输入数据格式
-
-### DAS CSV文件
-
-```csv
-ch_0,ch_1,ch_2,...,ch_191
-182,173,182,...,0
-120,120,134,...,-4
-...
+```powershell
+python realtime_infer_stream.py --name wangjiahui --model output/wangdihai/models/wangdihai_model.joblib
 ```
 
-- **列**：通道名 `ch_0`, `ch_1`, ..., `ch_N`
-- **行**：时间采样点（每行一个时间点）
-- **采样率**：2000 Hz
-- **数值**：信号强度（整数或浮点数）
+这条链路用于：
 
-### 音频/视频文件
+- 按 TDMS 分块模拟在线输入
+- 做带固定延迟的在线推理
+- 发送 `signal` 和 `event` JSON 包
+- 在 `JSONStreamPlot.py` 中实时看信号和事件
 
-- 支持格式：MP4, MOV, WAV, M4A, MP3 等
-- 建议采样率：≥ 44100 Hz（支持10kHz高频）
-- 单声道或立体声均可
+### 4.4 离线结果按在线协议回放
 
----
+如果你已经完成了离线推理，也可以直接把结果按在线协议发出去：
 
-## 输出文件说明
-
-### 1. 主检测结果
-
-#### `*_steps.csv`
-
-最终脚步检测结果，结构化CSV格式：
-
-```csv
-time,channel,confidence
-0.68,143,0.988
-0.98,16,0.506
-1.31,16,0.457
-...
+```powershell
+python workflow_infer.py wangjiahui `
+  --model output/wangdihai/models/wangdihai_model.joblib `
+  --stream_after_infer `
+  --host 127.0.0.1 `
+  --port 9000
 ```
 
-| 字段         | 说明                                              |
-| ------------ | ------------------------------------------------- |
-| `time`       | 脚步发生时间（秒），相对于裁剪后的数据起点        |
-| `channel`    | 脚步最可能发生的通道索引（0-N）                   |
-| `confidence` | 置信度（0-1），综合时间检测置信度和通道估计置信度 |
+这个模式的用途是：
 
-**置信度解释**：
+- 不重新做在线推理
+- 直接把离线推理结果转成在线 `signal/event` JSON 进行可视化联调
 
-- `> 0.8`：高置信，可直接使用
-- `0.5-0.8`：中置信，建议人工复核
-- `< 0.5`：低置信，可能是误检
+## 5. 离线训练工作流：`workflow_train.py`
 
----
+### 5.1 作用
 
-### 2. 可视化输出
+`workflow_train.py` 是从 `name` 到模型的完整训练入口，适合日常使用。
 
-#### `*_heatmap_steps.png`
+当前脚本默认目录：
 
-**主热图** - DAS能量热图 + 脚步事件标记
+- 音频：`Data/Audio`
+- Airtag：`Data/Airtag`
+- TDMS：`Data/DAS`
+- 输出：`output/<name>/`
 
-![示例](examples/output/wangdihai_heatmap_steps.png)
+### 5.2 常用命令
 
-- **上图**：时间×通道能量热图
-  - 横轴：时间（秒）
-  - 纵轴：通道索引
-  - 颜色：对数能量（viridis色彩映射）
-  - 散点：检测到的脚步事件，颜色表示置信度
-- **下图**：时间轴上的脚步概率曲线
-
-**用途**：
-
-- 查看脚步事件在时间和通道上的分布
-- 验证通道位置估计是否合理
-- 观察脚步事件的密度和规律
-
----
-
-#### `*_detailed_segments.png`
-
-**分段详细视图** - 多个时间段的放大视图
-
-- 将数据分成多个15秒片段
-- 每段单独显示热图和脚步标记
-- 标注每段检测到的脚步数量
-
-**用途**：
-
-- 详细检查特定时间段的检测结果
-- 发现遗漏或误检的脚步
-
----
-
-#### `*_channel_trajectory.png`
-
-**通道轨迹图** - 脚步通道随时间的变化
-
-- **上图**：通道轨迹散点图
-  - 横轴：时间
-  - 纵轴：通道
-  - 颜色：置信度
-- **下图**：步频间隔分布直方图
-  - 显示平均和中位数间隔
-
-**用途**：
-
-- 观察行走轨迹（通道位置变化）
-- 分析步频稳定性
-- 检测异常区间（间隔过长或过短）
-
----
-
-#### `*_comparison.png`
-
-**对比图** - 音频检测 vs DAS检测
-
-- **第1行**：音频包络曲线 + 音频检测的脚步
-- **第2行**：DAS概率曲线 + DAS检测的脚步
-- **第3行**：两种检测的叠加对比
-
-**用途**：
-
-- 验证DAS检测与音频检测的一致性
-- 发现DAS独立发现的新脚步
-- 评估弱监督效果
-
----
-
-### 3. 音频调优输出
-
-#### `*_audio_tuning_overview.png`
-
-**调优总览图** - 全面的音频检测分析
-
-- **第1行**：原始波形 + 带通滤波后波形
-- **第2行**：Z-score包络 + 检测阈值线
-- **第3行左**：脚步间隔分布直方图
-- **第3行右**：峰值高度分布直方图
-- **第4行**：详细片段视图（中间10秒）
-
-**用途**：
-
-- 验证音频检测参数是否合适
-- 观察检测阈值与峰值的关系
-- 分析步频分布是否合理
-
----
-
-#### `*_step_segments.png`
-
-**脚步波形片段** - 每个脚步附近的波形
-
-- 显示12个均匀分布的脚步
-- 每个图展示脚步前后0.5秒的波形
-- 红色竖线标记脚步时刻
-
-**用途**：
-
-- 确认检测到的是真实脚步声
-- 观察脚步信号的波形特征
-- 识别误检（非脚步的峰值）
-
----
-
-#### `*_das_audio_overlay.png`
-
-**DAS+音频叠加图** - 两路数据的对齐验证
-
-- **第1行**：DAS能量热图 + 音频脚步标记（红线）
-- **第2行**：DAS总能量曲线（所有通道叠加）
-- **第3行**：音频包络曲线
-
-**用途**：
-
-- 验证音频和DAS数据的时间对齐
-- 观察音频脚步在DAS热图上的响应
-- 确定是否需要调整align_dt参数
-
----
-
-#### `*_audio_steps.csv`
-
-音频检测的脚步时间列表：
-
-```csv
-time,height
-0.223,1.625
-0.538,1.336
-1.012,1.101
-...
+```powershell
+python workflow_train.py wangdihai
+python workflow_train.py wangdihai --trim_head 60 --trim_tail 30
+python workflow_train.py wangdihai --skip_channels 0
+python workflow_train.py wangdihai --model_type rf
+python workflow_train.py wangdihai --model_type cnn --device cuda
+python workflow_train.py wangdihai --dry_run
 ```
 
-| 字段     | 说明                |
-| -------- | ------------------- |
-| `time`   | 脚步时间（秒）      |
-| `height` | 峰值高度（Z-score） |
+### 5.3 关键参数
 
----
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `name` | 必填 | 对应 `Data/Audio/<name>.mp3` 与 `Data/Airtag/<name>.csv` |
+| `--trim_head` | `50.0` | 从头裁掉多少秒 |
+| `--trim_tail` | `20.0` | 从尾裁掉多少秒 |
+| `--skip_channels` | `18` | 跳过前 N 个通道 |
+| `--das_fs` | `2000` | DAS 采样率 |
+| `--output_dir` | `output` | 输出根目录 |
+| `--model_type` | `auto` | `auto/rf/cnn` |
+| `--device` | `auto` | `auto/cuda/cpu` |
+| `--self_train_rounds` | `0` | 自训练轮数 |
+| `--confidence_threshold` | `0.45` | 高置信阈值 |
+| `--torch_epochs` | `50` | CNN 训练轮数 |
+| `--torch_batch_size` | `128` | CNN batch size |
+| `--torch_lr` | `1e-4` | CNN 学习率 |
+| `--das_filter_method` | `sosfilt` | DAS 带通滤波方法 |
+| `--disable_das_bandpass` | 关闭 | 若开启则不做 DAS 带通 |
+| `--skip_extract` | 关闭 | 跳过切片步骤 |
+| `--overwrite` | 关闭 | 覆盖已有输出 |
+| `--dry_run` | 关闭 | 只打印命令，不执行 |
 
-## 参数调优指南
+### 5.4 训练产物
 
-### 音频检测参数
-
-#### 漏检太多（召回率低）
-
-| 参数          | 调整方向 | 原因               |
-| ------------- | -------- | ------------------ |
-| `peak_height` | ↓ 降低   | 接受更弱的峰值     |
-| `peak_prom`   | ↓ 降低   | 接受不太显著的峰值 |
-| `bp_low`      | ↓ 降低   | 捕获更多低频成分   |
-
-```bash
-python audio_step_tuning.py --audio video.mp4 --peak_height 0.5 --peak_prom 1.0
-```
-
-#### 误检太多（精确率低）
-
-| 参数           | 调整方向 | 原因             |
-| -------------- | -------- | ---------------- |
-| `peak_height`  | ↑ 提高   | 过滤弱信号       |
-| `peak_prom`    | ↑ 提高   | 要求更显著的峰值 |
-| `min_interval` | ↑ 提高   | 避免连续误检     |
-
-```bash
-python audio_step_tuning.py --audio video.mp4 --peak_height 1.0 --peak_prom 2.0
-```
-
----
-
-### 弱监督模型参数
-
-#### 检测结果太少
-
-| 参数                   | 调整方向 | 原因             |
-| ---------------------- | -------- | ---------------- |
-| `self_train_rounds`    | ↑ 增加   | 更多迭代补全漏检 |
-| `confidence_threshold` | ↓ 降低   | 接受更多新检测   |
-
-#### 检测结果噪声多
-
-| 参数                   | 调整方向 | 原因             |
-| ---------------------- | -------- | ---------------- |
-| `confidence_threshold` | ↑ 提高   | 只保留高置信预测 |
-| `self_train_rounds`    | ↓ 减少   | 避免过度扩展     |
-
-#### 训练时新增评估输出（推荐先看这个再调参）
-
-训练日志中会新增以下输出（`[Eval]`）：
-
-- 样本统计：`Samples / Pos / Neg`
-- 验证集 `PR-AUC`
-- 不同阈值下的 `Precision / Recall / F1` 表
-- 推荐阈值：`Best threshold=...`
-- 当前阈值：`Current confidence_threshold=...`
-
-示例（节选）：
+训练完成后通常会在：
 
 ```text
-[Eval] Samples=1200, Pos=300, Neg=900
-[Eval] Validation metrics by threshold:
-       thr    P      R      F1
-       0.50  0.82  0.71  0.76
-       0.55  0.86  0.68  0.76
-[Eval] PR-AUC=0.84
-[Eval] Best threshold=0.55 (P=0.860, R=0.680, F1=0.760)
-[Eval] Current confidence_threshold=0.70
-[Eval] Suggestion: try --confidence_threshold 0.55
+output/<name>/
+├── signals/
+│   └── <name>.csv
+├── models/
+│   └── <name>_model.joblib
+└── results/
+    ├── <name>_steps.csv
+    ├── <name>_metrics.txt
+    ├── <name>_heatmap_steps.png
+    ├── <name>_detailed_segments.png
+    ├── <name>_channel_trajectory.png
+    ├── <name>_learned_pattern.png
+    ├── <name>_heatmap_raw.png
+    ├── <name>_heatmap_bp_*.png
+    ├── <name>_comparison.png
+    └── <name>_audio_envelope_window.png
 ```
 
-按输出调参建议：
+其中：
 
-- **优先**按 `Best threshold` 先调整 `--confidence_threshold`
-- 若 `PR-AUC < 0.70`：先优化音频弱标签质量（`peak_height/peak_prom`），再看模型参数
-- 若 `Recall`低但`Precision`高：降低 `confidence_threshold` 或增加 `self_train_rounds`
-- 若 `Precision`低但`Recall`高：提高 `confidence_threshold` 或减少 `self_train_rounds`
-- 若三个人结果波动大：优先用 `workflow_train_multi.py` 训练联合模型
+- `*_steps.csv` 是最终脚步事件表。
+- `*_metrics.txt` 是评估指标文本。
+- `*_comparison.png` 和 `*_audio_envelope_window.png` 只有存在音频时才会生成。
 
----
+## 6. 离线推理工作流：`workflow_infer.py`
 
-### 滤波参数
+### 6.1 作用
 
-#### DAS滤波
+`workflow_infer.py` 是最常用的离线推理入口。  
+它支持三种输入方式：
 
-默认使用两个频带：
+1. 只给 `name`，自动切 TDMS 再推理
+2. 给 `name + --das_csv`，直接用已有 CSV 推理
+3. 给 `--with_audio`，在纯推理之外额外生成音频对比图
 
-- `5-10 Hz`：主频带（脚步主要响应）
-- `10-20 Hz`：高频辅助
+### 6.2 常用命令
 
-可在 `Config` 类中修改 `das_bp_bands`。
-
-#### 音频滤波
-
-- `4-10 kHz`：脚步声主要频带
-
-如果环境噪声较大，可尝试：
-
-- 提高 `bp_low` 到 5000 Hz
-- 降低 `bp_high` 到 8000 Hz
-
----
-
-## 示例输入输出
-
-### 输入数据示例
-
-**DAS CSV** (`wangdihai.csv`)：
-
-- 形状：434001行 × 192列
-- 采样率：2000 Hz
-- 时长：约217秒
-- 通道：ch_0 到 ch_191
-
-**视频** (`wangdihai.MP4`)：
-
-- 第一人称GoPro视频
-- 包含脚步声音频
-- 时长：与DAS数据对应
-
-### 处理配置
-
-```python
-trim_start = 50.0    # 从第50秒开始
-trim_end = 200.0     # 到第200秒结束（3分20秒）
-align_dt = 0.0       # 无需额外时间对齐
+```powershell
+python workflow_infer.py wangjiahui --model output/wangdihai/models/wangdihai_model.joblib
+python workflow_infer.py wangjiahui --model model.joblib --with_audio
+python workflow_infer.py wangjiahui --model model.joblib --das_csv output/wangjiahui/signals/wangjiahui.csv
+python workflow_infer.py wangjiahui --model model.joblib --dry_run
 ```
 
-### 输出结果统计
+### 6.3 关键参数
 
-| 指标             | 值              |
-| ---------------- | --------------- |
-| 音频检测脚步数   | 202             |
-| 弱监督检测脚步数 | 367             |
-| 检测时间范围     | 0.68s - 149.06s |
-| 平均置信度       | 0.639           |
-| 通道范围         | 0 - 143         |
-| 估计步频         | ~80 步/分钟     |
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `name` | 必填 | 对应 `Data/Airtag/<name>.csv` 的名字 |
+| `--model`, `-m` | 必填 | 训练好的 `.joblib` 模型 |
+| `--trim_head` | `50.0` | 从头裁掉多少秒 |
+| `--trim_tail` | `20.0` | 从尾裁掉多少秒 |
+| `--skip_channels` | `18` | 跳过前 N 个通道 |
+| `--das_fs` | `2000` | DAS 采样率 |
+| `--with_audio` | 关闭 | 推理时额外读取同名视频做音频对比；纯推理不需要它 |
+| `--das_csv` | 空 | 直接指定已有 DAS CSV |
+| `--output_dir` | `output/<name>` | 自定义输出根目录 |
+| `--das_filter_method` | `sosfilt` | DAS 带通滤波方法 |
+| `--disable_das_bandpass` | 关闭 | 关闭 DAS 带通 |
+| `--skip_extract` | 关闭 | 跳过切片 |
+| `--overwrite` | 关闭 | 覆盖已有结果 |
+| `--dry_run` | 关闭 | 只打印命令 |
 
-### 输出文件
+### 6.4 扩展参数
 
-见 `examples/output/` 目录下的所有文件。
+以下参数不是最小主线必需，但当前脚本仍支持：
 
----
+| 参数 | 作用 |
+| --- | --- |
+| `--double` | 将原始信号与镜像信号叠加后推理 |
+| `--mirror_only` | 仅用镜像信号推理 |
+| `--channel_shift` | 推理前对通道整体平移 |
+| `--stream_after_infer` | 推理后按在线协议发送结果 |
+| `--protocol` / `--host` / `--port` | 回放目标设置 |
+| `--signal_downsample` | 回放 `signal` 包降采样 |
+| `--udp_max_samples` | UDP 单包最大样本数 |
+| `--udp_max_bytes` | UDP 单包最大字节数 |
+| `--replay_speed` | 回放速度，`1.0` 近实时，`0` 不等待 |
 
-## 常见问题
+### 6.5 推理产物
 
-### Q: 为什么需要时间裁剪？
+推理结果通常位于：
 
-视频和DAS信号的开头结尾通常包含非步行部分（如设备启动、站立等），裁剪可以只保留有效的步行数据。
-
-### Q: 如何确定合适的裁剪范围？
-
-1. 先用 `audio_step_tuning.py` 大致浏览全时间段
-2. 观察脚步分布，确定步行开始和结束时间
-3. 设置 `trim_start` 和 `trim_end`
-
-### Q: 音频和DAS时间不对齐怎么办？
-
-1. 运行 `Tools/align_das_audio_qc.py` 计算偏移量
-2. 使用 `--align_dt` 参数传入偏移值
-3. DAS时间 = 音频时间 + align_dt
-
-### Q: 没有对应的音频文件怎么办？
-
-训练模式必须提供音频（用于生成弱标签），否则会直接报错。  
-如果已经有训练好的模型，可使用 `--load_model --inference_only` 在无音频条件下做推理。
-
-### Q: 检测到的通道位置不准确？
-
-通道位置估计基于能量分布，在信号较弱时可能不准确。可以：
-
-1. 提高 `confidence_threshold` 只保留高置信结果
-2. 检查是否存在热通道干扰
-3. 调整DAS滤波频带
-
-### Q: 训练好的模型可以用到其他数据上吗？
-
-**可以！** 只要布设和环境条件相似。使用模型保存/加载功能：
-
-```bash
-# 训练时保存模型
-python WeaklySupervised_FootstepDetector.py \
-    --das_csv train_data.csv \
-    --audio train_video.mp4 \
-    --save_model models/my_model.joblib
-
-# 在新数据上使用（无需音频）
-python WeaklySupervised_FootstepDetector.py \
-    --das_csv new_data.csv \
-    --load_model models/my_model.joblib \
-    --inference_only
+```text
+output/<name>/results/
+├── <base>_steps_inference.csv
+├── <base>_heatmap_inference.png
+├── <base>_trajectory_inference.png
+└── <base>_learned_pattern_inference.png
 ```
 
-**模型迁移适用场景**：
+如果脚本内部走的不是纯推理分支，也可能看到 `<base>_steps.csv`。  
+当前 `workflow_infer.py` 在回放离线结果时，会优先寻找：
 
-- ✅ 相同布设、相同环境
-- ✅ 相似的行走方式
-- ⚠️ 布设变化较大时建议重新训练
+1. `<base>_steps_inference.csv`
+2. `<base>_steps.csv`
 
-**模型文件内容**：
+## 7. 核心脚本：`WeaklySupervised_FootstepDetector.py`
 
-- 训练好的分类器（RandomForest/GradientBoosting）
-- 特征标准化器（StandardScaler）
-- 训练配置参数
+### 7.1 什么时候直接用它
 
----
+当你已经有 DAS CSV，或者你想直接控制训练/推理参数时，可以绕过 workflow，直接调用核心脚本。
 
-## 依赖安装
+### 7.2 训练示例
 
-```bash
-pip install numpy pandas scipy matplotlib librosa scikit-learn
+```powershell
+python WeaklySupervised_FootstepDetector.py `
+  --das_csv output/wangdihai/signals/wangdihai.csv `
+  --audio Data/Audio/wangdihai.mp3 `
+  --trim_start 50 `
+  --trim_end 180 `
+  --output_dir output/wangdihai/results `
+  --save_model output/wangdihai/models/wangdihai_model.joblib
 ```
 
-版本要求：
+### 7.3 仅推理示例
 
-- Python >= 3.8
-- numpy >= 1.20
-- pandas >= 1.3
-- scipy >= 1.7
-- matplotlib >= 3.4
-- librosa >= 0.9
-- scikit-learn >= 1.0
-
----
-
-## 算法原理
-
-### 1. 音频弱标签提取
-
-```
-音频 → 4-10kHz带通滤波 → RMS包络 → 对数变换 → 鲁棒Z-score → 峰值检测 → 脚步候选时间
+```powershell
+python WeaklySupervised_FootstepDetector.py `
+  --das_csv output/wangjiahui/signals/wangjiahui.csv `
+  --load_model output/wangdihai/models/wangdihai_model.joblib `
+  --inference_only `
+  --output_dir output/wangjiahui/results
 ```
 
-### 2. DAS多频带特征提取
+### 7.4 关键参数
 
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--das_csv`, `-d` | 必填 | DAS CSV 路径 |
+| `--audio`, `-a` | 空 | 音频或视频路径 |
+| `--trim_start` | 空 | 起始时间裁剪 |
+| `--trim_end` | 空 | 结束时间裁剪 |
+| `--das_fs` | `2000` | DAS 采样率 |
+| `--audio_sr` | `48000` | 音频重采样率 |
+| `--das_filter_method` | `filtfilt` | 核心脚本默认滤波方式 |
+| `--disable_das_bandpass` | 关闭 | 关闭 DAS 带通 |
+| `--align_dt` | `0.0` | 音频与 DAS 对齐偏移 |
+| `--model_type` | `auto` | `auto/rf/cnn` |
+| `--self_train_rounds` | `0` | 自训练轮数 |
+| `--confidence_threshold` | `0.35` | 高置信阈值 |
+| `--device` | `auto` | `auto/cuda/cpu` |
+| `--torch_epochs` | `50` | CNN 训练轮数 |
+| `--torch_batch_size` | `64` | CNN batch size |
+| `--torch_lr` | `1e-3` | CNN 学习率 |
+| `--torch_hidden_dim` | `64` | CNN 隐层维度 |
+| `--torch_dropout` | `0.1` | dropout |
+| `--cnn_window_s` | `0.12` | CNN 输入窗口秒数 |
+| `--cnn_predict_chunk` | `256` | CNN 预测分块大小 |
+| `--output_dir`, `-o` | `output/weakly_supervised` | 输出目录 |
+| `--save_model` | 空 | 训练后保存模型 |
+| `--load_model` | 空 | 加载模型 |
+| `--inference_only` | 关闭 | 仅推理；必须同时给 `--load_model` |
+
+### 7.5 一个重要区别
+
+`workflow_train.py` 和 `WeaklySupervised_FootstepDetector.py` 的默认值并不完全一致。  
+例如：
+
+- `workflow_train.py` 默认 `confidence_threshold=0.45`
+- `WeaklySupervised_FootstepDetector.py` 默认 `confidence_threshold=0.35`
+- `workflow_train.py` 默认 `torch_batch_size=128`
+- `WeaklySupervised_FootstepDetector.py` 默认 `torch_batch_size=64`
+- `workflow_train.py` 默认 `torch_lr=1e-4`
+- `WeaklySupervised_FootstepDetector.py` 默认 `torch_lr=1e-3`
+
+因此：
+
+- 想要和日常 workflow 保持一致时，优先使用 workflow。
+- 想做精细控制时，再直接调用核心脚本。
+
+## 8. TDMS 切片工具：`extract_name_signals_from_tdms.py`
+
+### 8.1 作用
+
+该脚本根据 Airtag CSV 里的起止时间，自动定位重叠的 TDMS 文件，并把对应时间段的 DAS 数据切成单个名字的 CSV。
+
+### 8.2 常用命令
+
+按视频或音频目录里的名字批量处理：
+
+```powershell
+python extract_name_signals_from_tdms.py `
+  --video-dir Data/Video `
+  --airtag-csv-dir Data/Airtag `
+  --tdms-dir Data/DAS `
+  --output-dir output/name_signals
 ```
-DAS → 多频带带通滤波 → 短时能量 → 特征向量
-     ├── 5-10Hz（主频带）
-     └── 10-20Hz（高频）
+
+只处理某个人：
+
+```powershell
+python extract_name_signals_from_tdms.py `
+  --video-dir Data/Video `
+  --airtag-csv-dir Data/Airtag `
+  --tdms-dir Data/DAS `
+  --output-dir output/name_signals `
+  --name wangdihai
 ```
 
-### 3. 弱监督训练
+没有视频也可仅按 Airtag 文件名处理：
 
-- **正样本**：音频检测到的脚步时间点（允许±0.5s误差）
-- **负样本**：远离任何脚步的时间点
-- **分类器**：随机森林（默认）或梯度提升
-
-### 4. 自训练迭代
-
-```
-初始弱标签 → 训练模型 → 预测 → 高置信预测 → 合并标签 → 重复
-```
-
-每轮迭代：
-
-1. 用当前标签训练新模型
-2. 在DAS数据上预测
-3. 筛选置信度 > 0.7 的新检测
-4. 合并到标签集，排除已有脚步附近的重复
-5. 重复，逐步提高召回率
-
-### 5. 通道位置估计
-
-```
-脚步时间 → 提取时间窗口 → 各通道能量 → Softmax归一化 → 选择最高能量通道
+```powershell
+python extract_name_signals_from_tdms.py `
+  --video-dir Data/Audio `
+  --airtag-csv-dir Data/Airtag `
+  --tdms-dir Data/DAS `
+  --output-dir output/name_signals `
+  --use-airtag-only
 ```
 
----
+### 8.3 关键参数
 
-## 版本历史
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--video-dir` | 必填 | 用于提供名字列表的目录 |
+| `--airtag-csv-dir` | 必填 | Airtag CSV 目录 |
+| `--tdms-dir` | 必填 | TDMS 目录 |
+| `--output-dir` | `output/name_signals` | 输出目录 |
+| `--fs` | `2000.0` | DAS 采样率 |
+| `--csv-utc-offset-hours` | `8.0` | CSV 时区偏移 |
+| `--name` | 空 | 只处理指定名字，可重复传入 |
+| `--encoding` | `utf-8-sig` | Airtag CSV 编码 |
+| `--overwrite` | 关闭 | 覆盖已有 CSV |
+| `--dry-run` | 关闭 | 只打印匹配，不写文件 |
+| `--use-airtag-only` | 关闭 | 不依赖视频文件名 |
+| `--skip-channels` | `18` | 跳过前 N 个通道 |
 
-- **v1.1** (2026-02-03)：模型保存/加载功能
-  - 新增 `--save_model` 参数保存训练好的模型
-  - 新增 `--load_model` 参数加载已有模型
-  - 新增 `--inference_only` 仅推理模式（无需音频）
-  - 支持模型跨数据迁移使用
+### 8.4 输出命名
 
-- **v1.0** (2026-02-03)：初始版本
-  - 弱监督脚步检测
-  - 自训练迭代
-  - 多种可视化输出
-  - 音频调优工具
+默认输出：
+
+```text
+output/name_signals/<name>.csv
+```
+
+而 workflow 会把输出放进：
+
+```text
+output/<name>/signals/<name>.csv
+```
+
+## 9. 在线推理模拟：`realtime_infer_stream.py`
+
+### 9.1 作用
+
+该脚本从 TDMS 原始数据中按块读取信号，做在线滤波和在线推理，并通过 UDP/TCP 发送 JSON 数据流。
+
+它的目标不是离线批处理，而是模拟“边到数据边检测边显示”的链路。
+
+### 9.2 使用示例
+
+```powershell
+python realtime_infer_stream.py `
+  --name wangjiahui `
+  --model output/wangdihai/models/wangdihai_model.joblib `
+  --protocol udp `
+  --host 127.0.0.1 `
+  --port 9000
+```
+
+### 9.3 关键参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--name` | 必填 | 对应 Airtag CSV 文件名 |
+| `--model`, `-m` | 必填 | 已训练模型路径 |
+| `--airtag-csv-dir` | `Data/Airtag` | Airtag 目录 |
+| `--tdms-dir` | `Data/DAS` | TDMS 目录 |
+| `--das-fs` | `2000.0` | DAS 采样率 |
+| `--skip-channels` | `18` | 跳过前 N 个通道 |
+| `--trim-head` | `50.0` | 头部裁掉秒数 |
+| `--trim-tail` | `20.0` | 尾部裁掉秒数 |
+| `--csv-utc-offset-hours` | `8.0` | CSV 时区偏移 |
+| `--chunk-seconds` | `1.0` | 每次读取的块长度 |
+| `--time-step` | `0.03` | 推理时间步长 |
+| `--buffer-seconds` | `10.0` | 环形缓冲区长度 |
+| `--latency-seconds` | `1.0` | 事件输出延迟 |
+| `--detrend-alpha` | `0.001` | 在线去趋势系数 |
+| `--speed` | `1.0` | 仿真速度，`0` 为不等待 |
+| `--max-seconds` | 空 | 最长回放时间 |
+| `--protocol` | `udp` | 网络协议 |
+| `--host` | `127.0.0.1` | 目标主机 |
+| `--port` | `9000` | 目标端口 |
+| `--signal-downsample` | `1` | `signal` 包降采样 |
+| `--udp-max-samples` | `10` | UDP 单包最大样本数 |
+| `--udp-max-bytes` | `60000` | UDP 单包最大字节数 |
+
+### 9.4 适用模型
+
+这个脚本走的是在线 CNN 推理思路，实际使用时建议传入由 CNN 路线得到的 `.joblib` 模型。
+
+## 10. 在线可视化：`JSONStreamPlot.py`
+
+### 10.1 作用
+
+`JSONStreamPlot.py` 是在线接收端。它监听 UDP 或 TCP 端口，接收：
+
+- `signal` 包：时间序列信号
+- `event` 包：脚步事件
+
+然后以实时曲线、热图和轨迹的方式显示。
+
+### 10.2 基本使用
+
+```powershell
+python JSONStreamPlot.py --protocol udp --host 0.0.0.0 --port 9000
+```
+
+### 10.3 常用显示参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--window-seconds` | `5.0` | 显示窗口长度 |
+| `--max-channels` | `0` | 最多显示多少通道，`0` 为全部 |
+| `--refresh-hz` | `20.0` | 刷新率 |
+| `--sample-rate` | 空 | 当包里不带采样率时的兜底值 |
+| `--max-events` | `2000` | 内存中保留的事件数 |
+| `--show-events` / `--hide-events` | 默认显示 | 是否显示事件点 |
+| `--show-heatmap` | 默认关闭 | 是否显示热图 |
+
+### 10.4 轨迹相关参数
+
+如果你要把事件映射到一条空间轨迹上显示，可以用：
+
+- `--trajectory-xz`
+- `--trajectory-channels`
+- `--channel-offset`
+- `--channel-tail-trim`
+- `--reverse-channel-direction`
+- `--no-reverse-channel-direction`
+- `--trajectory-fade-seconds`
+- `--trajectory-lost-timeout`
+- `--trajectory-position-alpha`
+- `--trajectory-smooth-speed`
+- `--trajectory-max-association-distance`
+- `--trajectory-max-velocity`
+- `--trajectory-velocity-alpha`
+- `--trajectory-point-size`
+- `--trajectory-glow-size`
+
+默认已经内置了一组 `XZ` 折线控制点，适合当前项目里已有的轨迹显示逻辑。
+
+## 11. 在线 JSON 协议
+
+### 11.1 `signal` 包
+
+在线发送端会发送如下结构的信号包：
+
+```json
+{
+  "packet_type": "signal",
+  "timestamp": 123.45,
+  "sample_rate": 2000.0,
+  "sample_count": 10,
+  "total_channels": 174,
+  "signals": [[...], [...]]
+}
+```
+
+字段含义：
+
+- `packet_type`: 固定为 `signal`
+- `timestamp`: 该块对应的时间戳
+- `sample_rate`: 采样率
+- `sample_count`: 这个包里包含的样本数
+- `total_channels`: 总通道数
+- `signals`: 信号矩阵
+
+### 11.2 `event` 包
+
+事件包结构：
+
+```json
+{
+  "packet_type": "event",
+  "timestamp": 123.78,
+  "channel_index": 96,
+  "confidence": 0.82
+}
+```
+
+字段含义：
+
+- `packet_type`: 固定为 `event`
+- `timestamp`: 事件时间
+- `channel_index`: 检测到的通道
+- `confidence`: 置信度
+
+这套协议目前由两条链路共享：
+
+1. `realtime_infer_stream.py` 在线模拟发送
+2. `workflow_infer.py --stream_after_infer` 离线结果回放发送
+
+## 12. 输出文件说明
+
+### 12.1 训练阶段常见输出
+
+| 文件 | 说明 |
+| --- | --- |
+| `*_steps.csv` | 最终脚步结果 |
+| `*_metrics.txt` | 指标文本 |
+| `*_heatmap_steps.png` | 总体热图 + 事件 |
+| `*_detailed_segments.png` | 多段细看图 |
+| `*_channel_trajectory.png` | 通道轨迹图 |
+| `*_learned_pattern.png` | 学到的模式 |
+| `*_heatmap_raw.png` | 原始热图 |
+| `*_heatmap_bp_<band>.png` | 分频带热图 |
+| `*_comparison.png` | 音频与 DAS 对比 |
+| `*_audio_envelope_window.png` | 音频包络窗口图 |
+
+### 12.2 推理阶段常见输出
+
+| 文件 | 说明 |
+| --- | --- |
+| `*_steps_inference.csv` | 纯推理结果 |
+| `*_heatmap_inference.png` | 推理热图 |
+| `*_trajectory_inference.png` | 推理轨迹图 |
+| `*_learned_pattern_inference.png` | 推理模式图 |
+
+### 12.3 `*_steps.csv` 结果字段
+
+结果 CSV 一般至少包含：
+
+- 时间
+- 通道
+- 置信度
+
+不同训练/推理路径下列名可能略有差别，但核心含义一致：在某个时间点、某个通道，模型认为存在脚步事件，并给出一个置信度分数。
+
+## 13. 3D-CNN 实验脚本
+
+当前 3D-CNN 方向位于：
+
+```text
+experiment/WeaklySupervised_FootstepDetector_3D_CNN.py
+```
+
+它是实验脚本，不是当前主线入口，但仍然是仓库中保留的研究方向。
+
+### 13.1 主要能力
+
+- 支持 `--name` 自动切 CSV
+- 支持 `--das_csv` 直接输入已有 CSV
+- 支持训练、保存模型、加载模型、仅推理
+- 默认输出到 `output/3d_cnn/<tag>/`
+
+### 13.2 关键参数
+
+| 参数 | 默认值 |
+| --- | --- |
+| `--bands` | `5-10,10-20,20-50,50-100` |
+| `--patch_frames` | `31` |
+| `--epochs` | `24` |
+| `--batch_size` | `96` |
+| `--lr` | `1e-3` |
+| `--score_threshold` | `0.40` |
+| `--peak_time_dist_s` | `0.20` |
+| `--peak_channel_dist` | `2` |
+
+### 13.3 常见输出
+
+- `<base>_steps_3dcnn.csv`
+- `<base>_heatmap_3dcnn.png`
+- `<base>_3dcnn.pt`
+
+## 14. 示例与历史文件
+
+### 14.1 示例输出
+
+仓库中已经附带了一些输出示例，可参考：
+
+```text
+examples/output/
+```
+
+其中包括：
+
+- `wangdihai_heatmap_steps.png`
+- `wangdihai_channel_trajectory.png`
+- `wangdihai_comparison.png`
+- `wangdihai_steps.csv`
+
+### 14.2 历史和废弃内容
+
+以下脚本不建议作为当前项目的主要入口：
+
+- `deprecated/workflow_train_multi.py`
+- `deprecated/audio_step_tuning.py`
+- `deprecated/batch_audio_spectrogram.py`
+- `deprecated/make_trajectory_animation.py`
+- `run_footstep_detection.py`
+
+如果后人接手项目，应优先看本 README 里的主线，不要先从这些文件入手。
+
+## 15. 常见问题
+
+### 15.1 `ModuleNotFoundError: No module named 'numpy'`
+
+说明当前 Python 环境没有装依赖。先执行：
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+或者使用虚拟环境里的解释器。
+
+### 15.2 `workflow_train.py` 说找不到音频
+
+当前训练工作流固定检查：
+
+```text
+Data/Audio/<name>.mp3
+```
+
+如果你的训练音频不是 `mp3`，需要先转成对应文件名的 `mp3`，或者修改脚本逻辑。
+
+### 15.3 `--skip_extract` 什么时候有用
+
+当你已经有：
+
+```text
+output/<name>/signals/<name>.csv
+```
+
+或者你通过 `--das_csv` 明确提供了 CSV 时，它可以避免再次从 TDMS 切片。
+
+### 15.4 workflow 和核心脚本参数为什么对不上
+
+这是当前仓库的真实状态，不是 README 写错。workflow 是“日常使用入口”，核心脚本是“底层实现入口”，二者默认值不完全一致。  
+如果你的目标是复现实验记录，优先使用当时实际调用的入口脚本。
+
+## 16. 推荐给后人的最短上手路径
+
+如果是第一次接手本项目，建议只按下面顺序理解：
+
+1. 先看本 README。
+2. 确认 `Data/Audio`、`Data/Airtag`、`Data/DAS` 的命名是否一致；`Data/Video` 只在需要音频对比时再检查。
+3. 跑 `python workflow_train.py <name> --dry_run` 看流程是否能串起来。
+4. 再跑正式训练。
+5. 用 `python workflow_infer.py <name> --model ...` 做离线推理。
+6. 最后再看 `realtime_infer_stream.py + JSONStreamPlot.py` 的在线链路。
+
+这样理解成本最低，也最接近这个仓库当前仍在使用的方式。
