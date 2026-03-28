@@ -22,8 +22,6 @@
 
 `deprecated/` 中的内容目前已废弃。
 
-- 
-
 ## 2. 目录与数据约定
 
 当前仓库目录中，和实际运行最相关的是以下部分：
@@ -42,13 +40,49 @@ WeaklySupervisedFootstep/
 ├── workflow_train.py
 ├── workflow_infer.py
 ├── WeaklySupervised_FootstepDetector.py
+├── wsfd/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── signal_utils.py
+│   ├── audio_labels.py
+│   ├── features.py
+│   ├── models.py
+│   ├── detector.py
+│   ├── visualization.py
+│   ├── pipeline.py
+│   └── cli.py
 ├── extract_name_signals_from_tdms.py
 ├── realtime_infer_stream.py
 ├── JSONStreamPlot.py
 └── requirements.txt
 ```
 
-### 2.1 数据目录含义
+### 2.1 当前代码结构
+
+`WeaklySupervised_FootstepDetector.py` 现在已经不是 2000 行的单体实现，而是一个兼容入口。实际实现集中在 `wsfd/`：
+
+- [WeaklySupervised_FootstepDetector.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/WeaklySupervised_FootstepDetector.py)
+  作用：根目录兼容入口，对外保留原来的命令行和导出名。
+- [wsfd/config.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/config.py)
+  作用：集中维护配置对象 `Config`。
+- [wsfd/signal_utils.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/signal_utils.py)
+  作用：带通、鲁棒 z-score、RMS、移动平均等通用信号处理函数。
+- [wsfd/audio_labels.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/audio_labels.py)
+  作用：从音频提取脚步候选时间，生成弱标签。
+- [wsfd/features.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/features.py)
+  作用：加载 DAS CSV、做多频带滤波、提特征、提 CNN patch、估计通道。
+- [wsfd/models.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/models.py)
+  作用：定义 CNN 结构和 PyTorch 二分类包装器。
+- [wsfd/detector.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/detector.py)
+  作用：负责准备训练样本、训练分类器、在时间网格上预测、自训练和模型保存加载。
+- [wsfd/visualization.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/visualization.py)
+  作用：集中管理热图、轨迹图、对比图等输出。
+- [wsfd/pipeline.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/pipeline.py)
+  作用：串联完整训练流程和纯推理流程。
+- [wsfd/cli.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/cli.py)
+  作用：核心脚本命令行入口。
+
+### 2.2 数据目录含义
 
 ```text
 Data/
@@ -71,7 +105,7 @@ Data/
 - `Data/Airtag/<name>.csv` 用于提供该人的起止时间窗口。
 - `Data/DAS/*.tdms` 是原始 DAS 文件，脚本会根据 Airtag 时间自动找重叠段并切片。
 
-### 2.2 Airtag CSV 基本要求
+### 2.3 Airtag CSV 基本要求
 
 `extract_name_signals_from_tdms.py` 要求 Airtag CSV 第一列是时间列，并且表头以 `datetime` 开头。脚本支持多种常见时间格式，包括：
 
@@ -81,7 +115,7 @@ Data/
 
 默认按 `UTC+8` 解释 CSV 时间，即 `--csv-utc-offset-hours 8.0`。
 
-### 2.3 DAS CSV 输出格式
+### 2.4 DAS CSV 输出格式
 
 切片完成后的 DAS CSV 形如：
 
@@ -362,7 +396,26 @@ output/<name>/results/
 
 当你已经有 DAS CSV，或者你想直接控制训练/推理参数时，可以绕过 workflow，直接调用核心脚本。
 
-### 7.2 训练示例
+### 7.2 现在的内部实现方式
+
+虽然你仍然可以像以前一样直接运行：
+
+```powershell
+python WeaklySupervised_FootstepDetector.py ...
+```
+
+但当前实现已经拆到 `wsfd/` 包里：
+
+- `WeaklySupervised_FootstepDetector.py` 只是兼容入口
+- `wsfd/cli.py` 负责解析参数和调用流程
+- `wsfd/pipeline.py` 负责训练/推理主流程
+- `wsfd/detector.py` 负责准备样本、训练模型和时间网格预测
+- `wsfd/features.py` 负责特征提取、CNN patch 构造和通道估计
+- `wsfd/models.py` 负责 CNN 模型本身
+
+因此后续如果要理解或修改算法逻辑，优先看 `wsfd/`，不要只盯着根目录入口。
+
+### 7.3 训练示例
 
 ```powershell
 python WeaklySupervised_FootstepDetector.py `
@@ -374,7 +427,7 @@ python WeaklySupervised_FootstepDetector.py `
   --save_model output/wangdihai/models/wangdihai_model.joblib
 ```
 
-### 7.3 仅推理示例
+### 7.4 仅推理示例
 
 ```powershell
 python WeaklySupervised_FootstepDetector.py `
@@ -384,7 +437,7 @@ python WeaklySupervised_FootstepDetector.py `
   --output_dir output/wangjiahui/results
 ```
 
-### 7.4 关键参数
+### 7.5 关键参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -413,7 +466,7 @@ python WeaklySupervised_FootstepDetector.py `
 | `--load_model` | 空 | 加载模型 |
 | `--inference_only` | 关闭 | 仅推理；必须同时给 `--load_model` |
 
-### 7.5 一个重要区别
+### 7.6 一个重要区别
 
 `workflow_train.py` 和 `WeaklySupervised_FootstepDetector.py` 的默认值并不完全一致。  
 例如：
@@ -429,6 +482,94 @@ python WeaklySupervised_FootstepDetector.py `
 
 - 想要和日常 workflow 保持一致时，优先使用 workflow。
 - 想做精细控制时，再直接调用核心脚本。
+
+### 7.7 当前模型到底在学什么
+
+这是当前项目最容易误解的地方。
+
+当前系统并不是直接学习 `(time, channel)` 二维定位，而是分成两步：
+
+1. 模型先学习“这个时间窗里有没有脚步”
+2. 检测到脚步时间后，再根据该时间附近的 DAS 能量分布估计通道
+
+对应实现：
+
+- 弱标签时间来自 [wsfd/audio_labels.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/audio_labels.py)
+- 训练样本准备在 [wsfd/detector.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/detector.py)
+- 时间网格预测在 [wsfd/detector.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/detector.py)
+- 通道估计在 [wsfd/features.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/features.py)
+
+更具体地说：
+
+- 音频先提供一组脚步候选时间 `audio_step_times`
+- 这些时间用于构造 DAS 正负样本窗口
+- 模型输出的是每个时间点的脚步概率曲线
+- 检测出脚步时间后，再调用 `estimate_channel_for_time()` 估计通道
+
+所以当前系统的监督目标是：
+
+- `这个时间窗是否包含脚步`
+
+而不是：
+
+- `这个脚步发生在哪个通道`
+
+### 7.8 RF 和 CNN 的区别
+
+RF 和 CNN 现在都主要服务于“时间检测”，但它们看到的输入不同。
+
+RF 分支在 [wsfd/features.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/features.py) 中使用汇总统计特征，包括：
+
+- 总能量
+- 最大通道能量
+- 平均能量
+- 能量标准差
+- 最大能量通道
+- 最大振幅
+- 平均波动
+
+因此 RF 更接近：
+
+- 基于多频带统计特征判断这个窗口像不像脚步
+
+CNN 分支则不使用这些汇总统计量，而是直接读取原始 patch。  
+在 [wsfd/features.py](C:/Users/boshu/Desktop/srt/WeaklySupervisedFootstep/wsfd/features.py) 中，CNN 输入的形状是：
+
+- `[N, B, W, C]`
+
+其中：
+
+- `B` 是频带数
+- `W` 是时间窗长度
+- `C` 是通道数
+
+这意味着 CNN 输入是一块完整的：
+
+- 频带 × 时间 × 通道
+
+时空 patch，而不是单个总能量值。
+
+### 7.9 为什么 CNN 学了时空结构，却仍然主要输出时间
+
+原因不是“学到的空间信息丢了”，而是训练目标没有要求它输出通道。
+
+当前 CNN 的损失函数只在乎：
+
+- 这个窗口是不是脚步窗口
+
+所以它虽然会利用时空结构来提高判断能力，但最终输出头仍然是二分类概率。  
+这可以理解为：
+
+- CNN 用时间-通道二维振动结构来做时间检测
+- 但并没有被监督成“直接输出通道位置”
+
+因此现在的系统是：
+
+- CNN 学时空纹理
+- 输出脚步时间概率
+- 通道位置再靠后处理估计
+
+如果后续研究要进一步往“端到端定位”走，才需要把通道预测也纳入模型监督目标。
 
 ## 8. TDMS 切片工具：`extract_name_signals_from_tdms.py`
 
