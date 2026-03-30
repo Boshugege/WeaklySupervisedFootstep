@@ -9,6 +9,7 @@ from .config import Config
 from .detector import SelfTrainingIterator, WeaklySupervisedDetector
 from .features import DASFeatureExtractor
 from .visualization import Visualizer
+from .signal_utils import bandpass_filter_2d
 
 def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
                  save_model_path=None, load_model_path=None):
