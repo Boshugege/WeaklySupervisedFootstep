@@ -77,6 +77,15 @@ class DASBandConfig:
     dp_curvature_penalty: float = 0.2
     dp_max_jump_ch: int = 6
     centroid_threshold: float = 0.2
+    decode_mode: str = "kalman"
+    kalman_process_var: float = 2.0
+    kalman_measurement_var: float = 0.8
+    kalman_measurement_var_floor: float = 0.15
+    kalman_init_pos_var: float = 4.0
+    kalman_init_vel_var: float = 1.0
+    sigma_scale: float = 0.7
+    sigma_min: float = 0.5
+    sigma_max: float = 3.0
 
     seed: int = 42
 

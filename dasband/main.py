@@ -65,6 +65,13 @@ def build_parser():
     parser.add_argument("--dp_curvature_penalty", type=float, default=0.2)
     parser.add_argument("--dp_max_jump_ch", type=int, default=6)
     parser.add_argument("--centroid_threshold", type=float, default=0.2)
+    parser.add_argument("--decode_mode", choices=["kalman", "dp"], default="kalman")
+    parser.add_argument("--kalman_process_var", type=float, default=2.0)
+    parser.add_argument("--kalman_measurement_var", type=float, default=0.8)
+    parser.add_argument("--kalman_measurement_var_floor", type=float, default=0.15)
+    parser.add_argument("--sigma_scale", type=float, default=0.7)
+    parser.add_argument("--sigma_min", type=float, default=0.5)
+    parser.add_argument("--sigma_max", type=float, default=3.0)
 
     parser.add_argument("--stop_after_prepare", action="store_true", help="Stop after pseudo label preparation.")
     parser.add_argument("--stop_after_train", action="store_true", help="Stop after training and do not run inference.")
@@ -131,6 +138,13 @@ def _build_config(args, das_csv: str, audio_path: Optional[str]):
         dp_curvature_penalty=args.dp_curvature_penalty,
         dp_max_jump_ch=args.dp_max_jump_ch,
         centroid_threshold=args.centroid_threshold,
+        decode_mode=args.decode_mode,
+        kalman_process_var=args.kalman_process_var,
+        kalman_measurement_var=args.kalman_measurement_var,
+        kalman_measurement_var_floor=args.kalman_measurement_var_floor,
+        sigma_scale=args.sigma_scale,
+        sigma_min=args.sigma_min,
+        sigma_max=args.sigma_max,
         seed=args.seed,
     )
 

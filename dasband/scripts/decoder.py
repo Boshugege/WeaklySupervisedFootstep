@@ -20,6 +20,15 @@ def weighted_centroid(mask: np.ndarray, threshold: float = 0.0):
     return (numer / denom).astype(np.float32)
 
 
+def estimate_measurement_confidence(mask: np.ndarray):
+    mask = np.asarray(mask, dtype=np.float64)
+    peak = np.max(mask, axis=1)
+    mass = np.sum(mask, axis=1)
+    concentration = peak / (mass + 1e-6)
+    conf = 0.7 * peak + 0.3 * np.clip(20.0 * concentration, 0.0, 1.0)
+    return np.clip(conf, 0.05, 0.95).astype(np.float32)
+
+
 def extract_path_dp(mask: np.ndarray, config: DASBandConfig):
     prob = np.clip(np.asarray(mask, dtype=np.float64), 1e-6, 1.0)
     emission = np.log(prob)
@@ -54,10 +63,62 @@ def extract_path_dp(mask: np.ndarray, config: DASBandConfig):
     return path.astype(np.float32)
 
 
-def estimate_uncertainty(mask: np.ndarray, path: np.ndarray):
+def kalman_smooth_track(measurements: np.ndarray, frame_times: np.ndarray, measurement_confidence: np.ndarray, config: DASBandConfig):
+    z = np.asarray(measurements, dtype=np.float64)
+    t = np.asarray(frame_times, dtype=np.float64)
+    conf = np.clip(np.asarray(measurement_confidence, dtype=np.float64), 0.05, 0.95)
+    n = len(z)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+    x_filt = np.zeros((n, 2), dtype=np.float64)
+    p_filt = np.zeros((n, 2, 2), dtype=np.float64)
+    x_pred = np.zeros((n, 2), dtype=np.float64)
+    p_pred = np.zeros((n, 2, 2), dtype=np.float64)
+
+    x_filt[0] = np.array([z[0], 0.0], dtype=np.float64)
+    p_filt[0] = np.diag([float(config.kalman_init_pos_var), float(config.kalman_init_vel_var)])
+
+    for i in range(1, n):
+        dt = max(1e-6, float(t[i] - t[i - 1]))
+        F = np.array([[1.0, dt], [0.0, 1.0]], dtype=np.float64)
+        q = float(config.kalman_process_var)
+        Q = q * np.array(
+            [[0.25 * dt ** 4, 0.5 * dt ** 3], [0.5 * dt ** 3, dt ** 2]],
+            dtype=np.float64,
+        )
+
+        x_pred[i] = F @ x_filt[i - 1]
+        p_pred[i] = F @ p_filt[i - 1] @ F.T + Q
+
+        H = np.array([[1.0, 0.0]], dtype=np.float64)
+        R = float(config.kalman_measurement_var_floor) + float(config.kalman_measurement_var) / (conf[i] ** 2)
+        S = H @ p_pred[i] @ H.T + np.array([[R]], dtype=np.float64)
+        K = p_pred[i] @ H.T @ np.linalg.inv(S)
+        innovation = np.array([z[i] - (H @ x_pred[i])[0]], dtype=np.float64)
+        x_filt[i] = x_pred[i] + (K @ innovation).reshape(-1)
+        p_filt[i] = (np.eye(2, dtype=np.float64) - K @ H) @ p_pred[i]
+
+    x_smooth = x_filt.copy()
+    p_smooth = p_filt.copy()
+    for i in range(n - 2, -1, -1):
+        dt = max(1e-6, float(t[i + 1] - t[i]))
+        F = np.array([[1.0, dt], [0.0, 1.0]], dtype=np.float64)
+        c = p_filt[i] @ F.T @ np.linalg.inv(p_pred[i + 1] + 1e-9 * np.eye(2))
+        x_smooth[i] = x_filt[i] + c @ (x_smooth[i + 1] - x_pred[i + 1])
+        p_smooth[i] = p_filt[i] + c @ (p_smooth[i + 1] - p_pred[i + 1]) @ c.T
+
+    return x_smooth[:, 0].astype(np.float32), x_smooth[:, 1].astype(np.float32)
+
+
+def estimate_uncertainty(mask: np.ndarray, path: np.ndarray, config: DASBandConfig | None = None):
     prob = np.asarray(mask, dtype=np.float64)
     channels = np.arange(prob.shape[1], dtype=np.float64)[None, :]
     path = np.asarray(path, dtype=np.float64)[:, None]
     numer = np.sum(((channels - path) ** 2) * prob, axis=1)
     denom = np.sum(prob, axis=1) + 1e-8
-    return np.sqrt(numer / denom).astype(np.float32)
+    sigma = np.sqrt(numer / denom).astype(np.float32)
+    if config is not None:
+        sigma = sigma * float(config.sigma_scale)
+        sigma = np.clip(sigma, float(config.sigma_min), float(config.sigma_max))
+    return sigma.astype(np.float32)

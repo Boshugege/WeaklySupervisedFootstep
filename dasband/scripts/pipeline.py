@@ -18,7 +18,14 @@ except Exception:  # pragma: no cover - import guard
 from .candidates import resolve_candidate_points
 from .config import DASBandConfig
 from .dataset import TimePatchDataset, build_patch_indices
-from .decoder import estimate_uncertainty, extract_path_dp, sigmoid, weighted_centroid
+from .decoder import (
+    estimate_measurement_confidence,
+    estimate_uncertainty,
+    extract_path_dp,
+    kalman_smooth_track,
+    sigmoid,
+    weighted_centroid,
+)
 from .io import (
     build_feature_cube,
     ensure_dir,
@@ -263,15 +270,28 @@ def run_inference(das_csv: str, checkpoint_path: str, config: DASBandConfig, out
     mask, checkpoint_config = infer_mask(feature_cube, checkpoint_path, config_override=config)
 
     centroid = weighted_centroid(mask, threshold=config.centroid_threshold)
-    path = extract_path_dp(mask, config)
-    sigma = estimate_uncertainty(mask, path)
+    measurement_confidence = estimate_measurement_confidence(mask)
+    dp_path = extract_path_dp(mask, config)
+    kalman_path, kalman_velocity = kalman_smooth_track(centroid, frame_times, measurement_confidence, config)
+
+    if str(config.decode_mode).lower() == "dp":
+        path = dp_path
+    else:
+        path = kalman_path
+
+    path = np.clip(path, 0.0, float(mask.shape[1] - 1)).astype(np.float32)
+    sigma = estimate_uncertainty(mask, path, config=config)
 
     np.save(out_dir / "pred_mask.npy", mask)
     pd.DataFrame(
         {
             "time": frame_times,
             "centroid_channel": centroid,
+            "dp_path_channel": dp_path,
+            "kalman_path_channel": kalman_path,
+            "kalman_velocity": kalman_velocity,
             "path_channel": path,
+            "measurement_confidence": measurement_confidence,
             "sigma": sigma,
         }
     ).to_csv(out_dir / "track.csv", index=False)
@@ -283,15 +303,27 @@ def run_inference(das_csv: str, checkpoint_path: str, config: DASBandConfig, out
             "used_trim_end_s": used_end_s,
             "feature_names": feature_names,
             "checkpoint_config": checkpoint_config.to_dict(),
+            "decode_mode": config.decode_mode,
         },
     )
-    plot_inference_result(primary_energy, frame_times, mask, path, sigma, str(out_dir / "inference_result.png"))
+    plot_inference_result(
+        primary_energy,
+        frame_times,
+        mask,
+        path,
+        sigma,
+        str(out_dir / "inference_result.png"),
+        centroid=centroid,
+        dp_path=dp_path,
+    )
     return {
         "output_dir": out_dir,
         "mask": mask,
         "frame_times": frame_times,
         "primary_energy": primary_energy,
         "centroid": centroid,
+        "dp_path": dp_path,
+        "kalman_path": kalman_path,
         "path": path,
         "sigma": sigma,
     }
