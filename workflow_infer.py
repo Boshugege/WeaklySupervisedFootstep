@@ -9,6 +9,7 @@
 使用示例：
     python workflow_infer.py wangjiahui --model output/wangdihai/models/wangdihai_model.joblib
     python workflow_infer.py wangjiahui --model models/pretrained.joblib --trim_head 50 --trim_tail 20
+    python workflow_infer.py wangjiahui --replay_only --stream_after_infer --replay_speed 1.0
 """
 
 import argparse
@@ -70,14 +71,20 @@ def parse_args():
 
     # 推理后按在线格式回放发送结果
     python workflow_infer.py wangjiahui --model model.joblib --stream_after_infer --host 127.0.0.1 --port 9000
+
+    # 仅回放之前推理过的结果（不重新推理）
+    python workflow_infer.py wangjiahui --replay_only --replay_speed 1.0 --mirror_only
+
+    # 指定steps通道模式，避免历史文件发生二次偏移
+    python workflow_infer.py wangjiahui --replay_only --steps_channel_mode global
         """
     )
     
     # 必需参数
     parser.add_argument("name", 
                         help="目标名字（对应Video中的MP4文件名，不含扩展名）")
-    parser.add_argument("--model", "-m", required=True,
-                        help="已训练模型的路径（.joblib文件）")
+    parser.add_argument("--model", "-m", required=False,
+                        help="已训练模型的路径（.joblib文件）；--replay_only 时可不提供")
     
     # 时间裁剪 - 从头尾裁掉的时长
     parser.add_argument("--trim_head", type=float, default=DEFAULT_TRIM_HEAD,
@@ -113,6 +120,8 @@ def parse_args():
                         help="仅使用通道镜像后的信号进行推理（不与原信号叠加）")
     parser.add_argument("--channel_shift", type=int, default=0,
                         help="对推理输入做通道偏移（正数向高通道移动，空位补0；默认0不偏移）")
+    parser.add_argument("--replay_only", action="store_true",
+                        help="仅回放历史推理结果并发送，不重新运行推理")
 
     # 推理后回放发送（在线同格式）
     parser.add_argument("--stream_after_infer", action="store_true",
@@ -131,6 +140,8 @@ def parse_args():
                         help="UDP包最大字节数，默认 60000")
     parser.add_argument("--replay_speed", type=float, default=0.0,
                         help="回放速度（1.0=实时，0=不等待），默认 0")
+    parser.add_argument("--steps_channel_mode", choices=["auto", "local", "global"], default="auto",
+                        help="steps CSV 的 channel 字段模式：local(局部索引)/global(全局通道号)/auto(自动判断，默认)")
     
     # 自定义路径
     parser.add_argument("--das_csv", type=str, default=None,
@@ -199,6 +210,7 @@ def send_packet(sock, protocol: str, host: str, port: int, payload: dict):
 def stream_offline_results(args, das_csv_path: Path, steps_csv_path: Path, trim_start: float, trim_end: float):
     import pandas as pd
     import numpy as np
+    import re
 
     if not steps_csv_path.exists():
         print(f"[WARN] 未找到steps结果文件，跳过回放发送: {steps_csv_path}")
@@ -216,28 +228,68 @@ def stream_offline_results(args, das_csv_path: Path, steps_csv_path: Path, trim_
         return
 
     replay_data = all_data[start_idx:end_idx, :]
-    total_channels = replay_data.shape[1]
-    channel_offset = max(0, int(args.skip_channels))
+
+    channel_ids = []
+    ch_pattern = re.compile(r"^ch_(\d+)$")
+    for i, col in enumerate(df_das.columns):
+        m = ch_pattern.match(str(col))
+        if m:
+            channel_ids.append(int(m.group(1)))
+        else:
+            channel_ids.append(i)
+
+    if len(channel_ids) != replay_data.shape[1]:
+        channel_ids = list(range(replay_data.shape[1]))
+
+    total_channels = int(max(channel_ids) + 1) if channel_ids else int(replay_data.shape[1])
+    need_signal_restore = (total_channels != replay_data.shape[1]) or (channel_ids and (min(channel_ids) != 0))
 
     df_steps = pd.read_csv(steps_csv_path)
     step_events = []
     local_max_ch = -1
+    global_max_ch = -1
+    min_channel_id = int(min(channel_ids)) if channel_ids else 0
+    max_channel_id = int(max(channel_ids)) if channel_ids else (int(replay_data.shape[1]) - 1)
+
+    step_mode = str(args.steps_channel_mode)
+    if step_mode == "auto" and (not df_steps.empty) and ("channel" in df_steps.columns):
+        step_min = int(df_steps["channel"].min())
+        step_max = int(df_steps["channel"].max())
+        # 自动规则：
+        # 1) 出现小于最小有效通道号（例如 ch_18 前的 0..17）=> local
+        # 2) 全部落在全局通道范围内 => global
+        # 3) 兜底按 local（兼容旧结果）
+        if step_min < min_channel_id:
+            step_mode = "local"
+        elif step_min >= min_channel_id and step_max <= max_channel_id:
+            step_mode = "global"
+        else:
+            step_mode = "local"
+
+    print(f"[STREAM] steps通道模式: {step_mode} (min_ch={min_channel_id}, max_ch={max_channel_id})")
+
     if not df_steps.empty and all(c in df_steps.columns for c in ["time", "channel", "confidence"]):
         for _, row in df_steps.sort_values("time").iterrows():
             ch = int(row["channel"])
             local_max_ch = max(local_max_ch, ch)
-            step_events.append((float(row["time"]), ch, float(row["confidence"])))
+            if step_mode == "global":
+                ch_global = int(ch)
+            else:
+                if 0 <= ch < len(channel_ids):
+                    ch_global = int(channel_ids[ch])
+                else:
+                    ch_global = int(ch)
+            global_max_ch = max(global_max_ch, ch_global)
+            step_events.append((float(row["time"]), ch_global, float(row["confidence"])))
 
     if local_max_ch >= 0:
-        effective_channels = int(local_max_ch + 1)
-        inferred_tail_trim = max(0, int(total_channels - channel_offset - effective_channels))
-        global_max = channel_offset + effective_channels - 1
+        inferred_tail_trim = max(0, int(total_channels - (global_max_ch + 1)))
         print(
-            f"[STREAM] 通道映射恢复: local[0..{local_max_ch}] -> global[{channel_offset}..{global_max}] "
-            f"(total={total_channels}, tail_trim={inferred_tail_trim})"
+            f"[STREAM] 通道映射恢复: local[0..{local_max_ch}] -> global[0..{global_max_ch}] "
+            f"(total={total_channels}, restore_zeros={need_signal_restore}, tail_trim={inferred_tail_trim})"
         )
     else:
-        print(f"[STREAM] 通道映射恢复: 无events，保持 total_channels={total_channels}")
+        print(f"[STREAM] 通道映射恢复: 无events，保持 total_channels={total_channels}, restore_zeros={need_signal_restore}")
 
     sock = open_sender(args.protocol, args.host, args.port)
     try:
@@ -255,19 +307,26 @@ def stream_offline_results(args, das_csv_path: Path, steps_csv_path: Path, trim_
             sample_rate = float(args.das_fs) / down
             ts = start / float(args.das_fs)
 
+            if need_signal_restore:
+                restored_chunk = np.zeros((chunk.shape[0], total_channels), dtype=chunk.dtype)
+                restored_chunk[:, channel_ids] = chunk
+                out_chunk = restored_chunk
+            else:
+                out_chunk = chunk
+
             payload = {
                 "packet_type": "signal",
                 "timestamp": ts,
                 "sample_rate": sample_rate,
-                "sample_count": int(chunk.shape[0]),
+                "sample_count": int(out_chunk.shape[0]),
                 "total_channels": int(total_channels),
-                "signals": chunk.tolist(),
+                "signals": out_chunk.tolist(),
             }
 
             if args.protocol == "udp" and args.udp_max_bytes and args.udp_max_bytes > 0:
                 data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 if len(data) > args.udp_max_bytes:
-                    reduced = chunk[: max(1, int(chunk.shape[0] / 2)), :]
+                    reduced = out_chunk[: max(1, int(out_chunk.shape[0] / 2)), :]
                     payload["signals"] = reduced.tolist()
                     payload["sample_count"] = int(reduced.shape[0])
 
@@ -279,7 +338,7 @@ def stream_offline_results(args, das_csv_path: Path, steps_csv_path: Path, trim_
                 event_payload = {
                     "packet_type": "event",
                     "timestamp": float(t),
-                    "channel_index": int(ch + channel_offset),
+                    "channel_index": int(ch),
                     "confidence": float(conf),
                 }
                 send_packet(sock, args.protocol, args.host, args.port, event_payload)
@@ -293,7 +352,7 @@ def stream_offline_results(args, das_csv_path: Path, steps_csv_path: Path, trim_
             event_payload = {
                 "packet_type": "event",
                 "timestamp": float(t),
-                "channel_index": int(ch + channel_offset),
+                "channel_index": int(ch),
                 "confidence": float(conf),
             }
             send_packet(sock, args.protocol, args.host, args.port, event_payload)
@@ -412,25 +471,38 @@ def main():
     print("脚步检测推理工作流")
     print("="*60)
     print(f"目标名字: {name}")
-    print(f"使用模型: {args.model}")
+    print(f"使用模型: {args.model if args.model else '(未指定)'}")
     print(f"时间裁剪: 头部 -{args.trim_head}s, 尾部 -{args.trim_tail}s")
     print(f"跳过通道: 前 {args.skip_channels} 个")
     print(f"DAS采样率: {args.das_fs} Hz")
     print(f"双人模拟: {'开启' if args.double else '关闭'}")
     print(f"纯镜像: {'开启' if args.mirror_only else '关闭'}")
     print(f"通道偏移: {args.channel_shift}")
-    print(f"模式: {'带音频对比' if args.with_audio else '纯推理（无需音频）'}")
+    print(f"仅回放历史结果: {'开启' if args.replay_only else '关闭'}")
+    run_mode = "仅回放历史结果" if args.replay_only else ("带音频对比" if args.with_audio else "纯推理（无需音频）")
+    print(f"模式: {run_mode}")
 
     if args.double and args.mirror_only:
         print("[ERROR] 参数冲突：--double 与 --mirror_only 不能同时开启")
         return 1
     
     # ===== 1. 检查模型文件 =====
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"\n[ERROR] 模型文件不存在: {model_path}")
-        return 1
-    print(f"\n[CHECK] 模型文件: {model_path} ✓")
+    model_path = None
+    if not args.replay_only:
+        if not args.model:
+            print("\n[ERROR] 非 --replay_only 模式下必须提供 --model")
+            return 1
+        model_path = Path(args.model)
+        if not model_path.exists():
+            print(f"\n[ERROR] 模型文件不存在: {model_path}")
+            return 1
+        print(f"\n[CHECK] 模型文件: {model_path} ✓")
+    elif args.model:
+        model_path = Path(args.model)
+        if model_path.exists():
+            print(f"\n[CHECK] 回放模式检测到模型文件（不会用于推理）: {model_path} ✓")
+        else:
+            print(f"\n[WARN] 回放模式下指定的模型文件不存在（可忽略）: {model_path}")
     
     # ===== 2. 确定DAS CSV路径 =====
     if args.das_csv:
@@ -533,7 +605,7 @@ def main():
     if not args.dry_run:
         results_output_dir.mkdir(parents=True, exist_ok=True)
     
-    # ===== 7. 运行推理 =====
+    # ===== 7. 运行推理（或仅回放） =====
     infer_das_csv_path = das_csv_path
     use_augmented_input = args.double or args.mirror_only or (int(args.channel_shift) != 0)
     if use_augmented_input and not args.dry_run:
@@ -559,43 +631,50 @@ def main():
         infer_das_csv_path = augmented_csv_path
         print(f"[AUG] 输入切换为增强信号: {infer_das_csv_path}")
 
-    infer_cmd = [
-        sys.executable, str(SCRIPT_DIR / "WeaklySupervised_FootstepDetector.py"),
-        "--das_csv", str(infer_das_csv_path),
-        "--trim_start", str(trim_start),
-        "--trim_end", str(trim_end),
-        "--das_fs", str(args.das_fs),
-        "--das_filter_method", str(args.das_filter_method),
-        "--output_dir", str(results_output_dir),
-        "--load_model", str(model_path),
-    ]
-    if args.disable_das_bandpass:
-        infer_cmd.append("--disable_das_bandpass")
-    
-    if args.with_audio:
-        # 带音频对比模式
-        video_path = find_video(name)
-        if video_path:
-            infer_cmd.extend(["--audio", str(video_path)])
-            print(f"[INFO] 使用音频进行对比: {video_path}")
+    if not args.replay_only:
+        infer_cmd = [
+            sys.executable, str(SCRIPT_DIR / "WeaklySupervised_FootstepDetector.py"),
+            "--das_csv", str(infer_das_csv_path),
+            "--trim_start", str(trim_start),
+            "--trim_end", str(trim_end),
+            "--das_fs", str(args.das_fs),
+            "--das_filter_method", str(args.das_filter_method),
+            "--output_dir", str(results_output_dir),
+            "--load_model", str(model_path),
+        ]
+        if args.disable_das_bandpass:
+            infer_cmd.append("--disable_das_bandpass")
+        
+        if args.with_audio:
+            # 带音频对比模式
+            video_path = find_video(name)
+            if video_path:
+                infer_cmd.extend(["--audio", str(video_path)])
+                print(f"[INFO] 使用音频进行对比: {video_path}")
+            else:
+                print(f"[WARN] 未找到视频文件，将使用纯推理模式")
+                infer_cmd.append("--inference_only")
         else:
-            print(f"[WARN] 未找到视频文件，将使用纯推理模式")
+            # 纯推理模式
             infer_cmd.append("--inference_only")
+        
+        ret = run_command(infer_cmd, "使用模型进行脚步检测", args.dry_run)
+        if ret != 0:
+            print("[ABORT] 推理失败")
+            return ret
     else:
-        # 纯推理模式
-        infer_cmd.append("--inference_only")
-    
-    ret = run_command(infer_cmd, "使用模型进行脚步检测", args.dry_run)
-    if ret != 0:
-        print("[ABORT] 推理失败")
-        return ret
+        print("\n[SKIP] --replay_only 已开启，跳过推理阶段")
 
     # ===== 8. 按在线格式回放发送 =====
-    if args.stream_after_infer and not args.dry_run:
+    if (args.stream_after_infer or args.replay_only) and not args.dry_run:
         base_name = Path(infer_das_csv_path).stem
         steps_infer_csv = results_output_dir / f"{base_name}_steps_inference.csv"
         steps_default_csv = results_output_dir / f"{base_name}_steps.csv"
         steps_csv_path = steps_infer_csv if steps_infer_csv.exists() else steps_default_csv
+        if not steps_csv_path.exists():
+            print(f"[ERROR] 未找到可回放的历史推理结果: {steps_infer_csv.name} / {steps_default_csv.name}")
+            print("        可先运行一次正常推理，或调整 --double/--mirror_only/--channel_shift 对应到已存在结果")
+            return 1
         print(f"[STREAM] 使用事件文件: {steps_csv_path.name}")
         stream_offline_results(args, infer_das_csv_path, steps_csv_path, trim_start, trim_end)
     
@@ -606,7 +685,8 @@ def main():
     print(f"DAS信号CSV: {das_csv_path}")
     if infer_das_csv_path != das_csv_path:
         print(f"推理输入CSV: {infer_das_csv_path}")
-    print(f"使用的模型: {model_path}")
+    if model_path is not None:
+        print(f"使用的模型: {model_path}")
     print(f"检测结果目录: {results_output_dir}")
     
     # 列出生成的文件

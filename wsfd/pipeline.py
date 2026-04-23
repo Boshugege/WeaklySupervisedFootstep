@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,39 @@ from .detector import SelfTrainingIterator, WeaklySupervisedDetector
 from .features import DASFeatureExtractor
 from .visualization import Visualizer
 from .signal_utils import bandpass_filter_2d
+
+
+def _parse_channel_ids_from_columns(columns):
+    ids = []
+    pat = re.compile(r"^ch_(\d+)$")
+    for i, col in enumerate(columns):
+        m = pat.match(str(col))
+        if m:
+            ids.append(int(m.group(1)))
+        else:
+            ids.append(i)
+    return ids
+
+
+def _restore_channel_matrix(energy_matrix, channel_ids):
+    if energy_matrix is None or len(channel_ids) == 0:
+        return energy_matrix
+    c, t = energy_matrix.shape
+    if len(channel_ids) != c:
+        return energy_matrix
+    total_channels = int(max(channel_ids) + 1)
+    if total_channels == c and min(channel_ids) == 0:
+        return energy_matrix
+    restored = np.zeros((total_channels, t), dtype=energy_matrix.dtype)
+    restored[channel_ids, :] = energy_matrix
+    return restored
+
+
+def _map_local_channel_to_global(ch_local, channel_ids):
+    ch_local = int(ch_local)
+    if 0 <= ch_local < len(channel_ids):
+        return int(channel_ids[ch_local])
+    return ch_local
 
 def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
                  save_model_path=None, load_model_path=None):
@@ -38,6 +72,8 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     das_extractor = DASFeatureExtractor(config)
     das_raw, ch_cols = das_extractor.load_das_csv(das_csv)
     
+    channel_ids = _parse_channel_ids_from_columns(ch_cols)
+
     # 时间裁剪
     das_trimmed = das_extractor.trim_data(das_raw, 
                                           config.trim_start_s, 
@@ -50,6 +86,7 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     # 计算主频带能量矩阵（用于可视化）
     das_primary = das_bands[primary_band]
     energy_matrix, frame_times = das_extractor.compute_short_time_energy(das_primary)
+    energy_matrix = _restore_channel_matrix(energy_matrix, channel_ids)
     
     print(f"[DAS] Energy matrix shape: {energy_matrix.shape}")
     
@@ -129,7 +166,8 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
     step_events = []
     for t, prob in zip(step_times_detected, step_probs):
         ch, ch_conf = das_extractor.estimate_channel_for_time(das_primary, t)
-        step_events.append((t, ch, prob * ch_conf))
+        ch_global = _map_local_channel_to_global(ch, channel_ids)
+        step_events.append((t, ch_global, prob * ch_conf))
     
     print(f"\n[Result] Detected {len(step_events)} footstep events")
     
@@ -154,6 +192,7 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
 
     # 额外输出：未经过带通滤波的原始信号热图
     raw_energy_matrix, raw_frame_times = das_extractor.compute_short_time_energy(das_trimmed)
+    raw_energy_matrix = _restore_channel_matrix(raw_energy_matrix, channel_ids)
     raw_heatmap_path = os.path.join(config.output_dir, f"{base_name}_heatmap_raw.png")
     viz.plot_signal_heatmap(
         raw_energy_matrix,
@@ -182,6 +221,7 @@ def run_pipeline(das_csv, audio_path, config: Config, align_dt=0.0,
             method=config.das_filter_method,
         )
         band_energy, band_frame_times = das_extractor.compute_short_time_energy(das_bp)
+        band_energy = _restore_channel_matrix(band_energy, channel_ids)
         band_tag = f"{str(low).replace('.', 'p')}_{str(high).replace('.', 'p')}Hz"
         band_heatmap_path = os.path.join(config.output_dir, f"{base_name}_heatmap_bp_{band_tag}.png")
         viz.plot_signal_heatmap(
@@ -376,6 +416,7 @@ def run_inference_only(das_csv, model_path, config):
     das_extractor = DASFeatureExtractor(config)
     
     df_das = pd.read_csv(das_csv)
+    channel_ids = _parse_channel_ids_from_columns(list(df_das.columns))
     das_raw = df_das.values.astype(np.float32)
     
     # 时间裁剪
@@ -394,6 +435,7 @@ def run_inference_only(das_csv, model_path, config):
     
     # 能量矩阵
     energy_matrix, frame_times = das_extractor.compute_short_time_energy(das_primary)
+    energy_matrix = _restore_channel_matrix(energy_matrix, channel_ids)
     
     # ===== 3. 特征提取和预测 =====
     # 使用 detector.predict_on_grid 进行网格预测
@@ -412,7 +454,8 @@ def run_inference_only(das_csv, model_path, config):
     step_events = []
     for t, prob in zip(step_times_detected, step_probs):
         ch, ch_conf = das_extractor.estimate_channel_for_time(das_primary, t)
-        step_events.append((t, ch, prob * ch_conf))
+        ch_global = _map_local_channel_to_global(ch, channel_ids)
+        step_events.append((t, ch_global, prob * ch_conf))
     
     # ===== 5. 可视化输出 =====
     viz = Visualizer(config)
